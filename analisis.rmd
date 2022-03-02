@@ -1,0 +1,4415 @@
+---
+title: "Análisis espacio-temporal de la dinámica dispersiva de *B. terrestris* y su efecto en las poblaciones de *B. dahlbomii*"
+author: "Lican Martínez"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r global-options, echo=F}
+
+#html_notebook: default
+
+knitr::opts_chunk$set(fig.width=8, fig.height=4, dev = 'emf', fig.ext = 'emf',
+                      echo=T, warning=FALSE, message=FALSE, results='hide')
+```
+
+```{r heavy code run switch}
+
+climtic.data.porcess=F # preocess climatic data and PC computation
+
+
+
+mcmc.exec=F # run mcmc chains
+
+run.pp.check.sims=F # run simulations of BT from 1997 for ppcheck
+
+run.future.BT.sims=F # run simulations ob BT from 2021 to future
+
+
+
+
+```
+
+```{r Librerías,}
+library(ggplot2) #ploting
+library(GGally) # for scatter matrix plot
+library(ggnewscale) # new_cale_fill
+library(tidyr) #datamanipulation
+#library(dplyr) #datamanipulation
+library(raster) #rastermanipulation
+library(dismo) #maxentandgbiffunctions
+library(arm) #invlogit()function
+library(RStoolbox) #forrasterPCA()function
+library(corrplot)
+library(spatstat) # for density kenrels
+library(rgdal)
+library(sp)
+library(sf)
+library(rgeos)
+library(MASS) # funcion mvrnorm 
+library(reshape)
+
+library(coda) # for mcmc diagnosis
+library(knitr)
+# ver cuáles se repiten !!!!!!!!!!!
+library(truncnorm)
+#library(ggplot2)
+library(dplyr)
+library(viridis)
+library(maptools)
+library(ggExtra)
+library(gridExtra)
+library(ggpubr)
+library(lemon) # grid arrange shared legend
+library(latex2exp)
+library(cowplot)
+library(ggsn) # for sclaes, not working
+library(ggspatial)
+#library(rworldmap) # latam map
+#library(maps) # latam map
+library(rnaturalearth)
+library(devEMF) # vector word graphics
+
+```
+
+# Introducción
+
+El objetivo de esta parte del trabajo es parametrizar un modelo de dispersión de *B. terrestris* en Patagonia a partir de datos de ocurrencias registradas históricamente a lo largo de la región. El modelo pretende contemplar dos aspectos: la capacidad de dispersión espacial y el efecto de las condiciones ambientales en este proceso.
+
+Para esto me basaré en una estrategia similar a la propuesta por **Cook et al. (2007)** en la que se construye una función de likelihood para los datos en función de parametros de un kernel de dispersión y un modelo de nicho ambiental. Esta función de likelihood puede ser luego utilizada para estimar las distribuciones posteriores de los parámetros mediante un enfoque bayesiano.
+
+El abordaje consiste en discretizar los datos espaciales en celdas y tratar de conectarlos con parámetros que determinen la tasa de colonización de las mismas. Estos parámetros estarían asociados a las condiciones ambientales de una celda particular (componente de nicho ambinetal) y las distancias a las celdas que hayan sido colonizadas previamente a esa (componente de dispersión espacial).
+
+En un escenario simplificado, podemos modelar el proceso de colonización de una celda a otra como un proceso de *Poisson*:
+
+$$P(T)=\phi*e^{-\phi T}$$
+
+en el que $P(T)$ es la probabilidad de que el tiempo que tarda una celda en ser colonizada por otra sea $T$, y $\phi$ es la tasa de colonización. En este modelo podemos hacer que $\phi$ dependa de la distancia entre las celdas y las condiciones ambientales de la celda colonizada.
+
+$$\phi_{}=f(d, \gamma)*S(\vec{A},\vec{\beta})$$
+
+donde $d_{}$ es la distancia euclidea entre las celdas, $\gamma$ es un parámetro del kernel de dispersión, y $S$ es la colonizabilidad intrínseca de la celda de destino (*suitabilidad*) dada por las condiciones ambientales $\vec{A}$ y los parámetros del modelo de nihco $\vec{\beta}$. Como una celda puede tener más de una fuente de colonización, podemos integrar las contribuciones de todas las celdas fuente y considerar la probabilidad de colonización a un tiempo $Ti$
+
+$$
+P(T_i)=\sum_j{\phi_j} * e^{\sum_j{\phi_j(T_i-T_j)}}
+$$
+
+
+$$
+\phi_j=f(d_{ij}, \gamma)*S(\vec{A_i}, \vec{\beta})
+$$
+donde $P(T_i)$ es la probabilidad de que la celda $i$ sea colonizada en el tiempo observado $T_i$ dado un conjunto de celdas colonizadas cada una a tiempo $T_j$ (tal que $T_j<T_i$), las cuales están a distancias $d_{ij}$ de la celda $i$.
+
+Por otra parte, también podemos calcular la probabilidad de la no colonización de una celda por parte de otra durante un período de registro como
+$$
+P(0)=e^{-\phi T}
+$$
+lo que al integrar las contribciones de todas las celdas colonizadas queda como
+
+$$
+P(0_i)=e^{\sum_j{\phi_j(T_f-T_j)}}
+$$
+donde $T_j$ es el último año del período contemplado.
+
+Para calcular un likelihood de todo el conjunto de datos, podemos computar el productorio de las probabilidades de colonización de todas las celdas colonizadas $C$ y de no colonización de todas las celdas sin registros $C^*$
+$$
+L=\prod_{i}^C{ \left[ \sum_j{\phi_j} * e^{\sum_j{\phi_j(T_i-T_j)}} \right] *
+\prod_i^{C^*}{ \left [ e^{\sum_j{\phi_j(T_f-T_j)}} \right]} }
+$$
+Por razones computacionales, es conveniente evaluar el *log-likelihood* ya que los productorios de una gran cantidad likelihoods pueden arrojar valores demasiado pequeños.
+$$
+log(L)=\sum_{i}^C{ log\left[ \sum_j{\phi_j} * e^{\sum_j{\phi_j(T_i-T_j)}} \right] +
+\sum_i^{C^*}{ log\left[ e^{\sum_j{\phi_j(T_f-T_j)}} \right]} } 
+$$
+
+## Disclaimer
+
+Este modelo supone que las celdas sin registros no han sido colonizadas. Por lo tanto, ignora la posibilidad de falsos negativos: celdas en las que la especie está presente pero no ha sido observada debido a la incompletitud del registro. Sortear este problema es más complicado de lo que uno podría suponer *a priori*, ya que para contemplar el sesgo de muestreo no alcanza con estimar un parámetro constante asociado a la probabilidad de no registrar a la especie en una celda colonizada, sino que es necesario tener en cuenta la probabilidad de colonización de las celdas con registros desde todas aquellas que se observan vacías. En la práctica, esto consistiría en construír y parametrizar un modelo oculto de dispersión, sobre el cual se acoplaría un modelo de observación de los registros. La escala de complejidad de un modelo así sería mucho mayor a la del que presento en este trabajo, por lo que, por simplicidad, de momento considero aceptable no relajar el supuesto de la no existencia de falsos negativos.
+
+# Implementación
+
+
+
+
+## Variables ambientales
+
+
+
+```{r Climatic data processing}
+
+
+global_bioclim.dir='D:/global_bioclim/'
+
+
+if (climtic.data.porcess) {
+    
+  r=stack(paste0(global_bioclim.dir, 'bioclim_res2.grd'))
+  
+  lonlat.crs=crs(r$bio1)
+  
+  nproj="+proj=utm +zone=19H +datum=WGS84"
+  
+  # patagonia no masking bioclimatic data
+  ext=c(-76, -65, -58, -25)
+  bio.patag.all=crop(x = r, y=ext)%>%
+    projectRaster(crs=nproj)
+  
+  # latinoamerica bioclimatic data
+  latam.proj="+proj=utm +zone=21H +datum=WGS84"
+  
+  latam.ext=c(-90, -25, -60, 15)
+  bio.latam=crop(r, y=latam.ext)
+  bio.latam.utm=projectRaster(bio.latam, crs = latam.proj)
+  
+  pc.latam.latam=RStoolbox::rasterPCA(bio.latam.utm, spca=T)
+  names(pc.latam.latam$map)=paste0('PC_', 1:19)
+  
+  pc.latam.patag=raster::predict(bio.patag.all, pc.latam.latam$model, index=1:19) %>% 
+    stack()
+  names(pc.latam.patag)=paste0('PC_', 1:19)
+  
+  # europe bioclimatic data and PCs
+  bio.eu=crop(x = r, y=c(-12, 30, 34, 72))
+  
+  pc.eu.from.latam=raster::predict(bio.eu, pc.latam.latam$model, index=1:19) %>% 
+    stack()
+  names(pc.eu.from.latam)=paste0('PC_', 1:19)
+  
+  
+  saveRDS(lonlat.crs, file='./intermediate_files/lonlat.crs.RDS')
+  saveRDS(nproj, file='./intermediate_files/nproj.RDS')
+  saveRDS(latam.proj, file='./intermediate_files/latam.proj.RDS')
+  saveRDS(latam.ext, file='./intermediate_files/latam.ext.RDS')
+  saveRDS(bio.latam.utm, file='./intermediate_files/bio.latam.utm.RDS')
+  saveRDS(pc.latam.latam, file='./intermediate_files/pc.latam.latam.RDS')
+  saveRDS(pc.latam.patag, file='./intermediate_files/pc.latam.patag.RDS')
+  saveRDS(bio.eu, file='./intermediate_files/bio.eu.RDS')
+  saveRDS(pc.eu.from.latam, file='./intermediate_files/pc.eu.from.latam.RDS')
+
+}else{
+  lonlat.crs = readRDS(file='./intermediate_files/lonlat.crs.RDS')
+  nproj = readRDS(file='./intermediate_files/nproj.RDS')
+  latam.proj = readRDS(file='./intermediate_files/latam.proj.RDS')
+  latam.ext = readRDS(file='./intermediate_files/latam.ext.RDS')
+  bio.latam.utm = readRDS(file='./intermediate_files/bio.latam.utm.RDS')
+  pc.latam.latam = readRDS(file='./intermediate_files/pc.latam.latam.RDS')
+  pc.latam.patag = readRDS(file='./intermediate_files/pc.latam.patag.RDS')
+  bio.eu = readRDS(file='./intermediate_files/bio.eu.RDS')
+  pc.eu.from.latam = readRDS(file='./intermediate_files/pc.eu.from.latam.RDS')
+}
+
+
+```
+
+```{r Cum.variance PCs}
+sum.pc=pc.latam.latam$model%>%summary()
+
+vars <- sum.pc$sdev^2
+vars <- vars/sum(vars)
+
+vars.cum=round(vars*100, 1)
+
+pc3.cum=round(cumsum(vars)[3]*100, 1)
+
+
+```
+
+
+Para considerar los factores ambientales se tuvieron en cuenta 19 variables bioclimáticas de la base de datos WorlClim2. Estas fueron procesadas mediante un análisis de componentes principales (PCA) utilizando los datos de todo Sudamérica, conservando las primeras 3 componentes (`r pc3.cum` % de la varianza).
+
+```{r PCs in Latam plots ,fig.height=4, fig.width=6}
+plot(pc.latam.latam$model, 
+     main='', las=2)
+
+#layout(matrix(1:3, ncol=3))
+#par(mar=c(4, 3, 4, 3))
+
+#for (i in 1:3) {
+#  plot(pc.latam.latam$map[[i]], 
+#       main=paste0('PC_', i))
+#}
+
+
+
+```
+
+```{r, fig.height=4, fig.width=9}
+
+load=pc.latam.latam$model$loadings[,1:3]%>%as.data.frame()
+
+load$var=rownames(load)
+
+load=pivot_longer(load, cols = 1:3, names_to = )
+
+
+load$name=as.factor(load$name)
+#load=load[load$name=='Comp.1',]
+
+
+load.or=data.frame(var=NULL, 
+                name=NULL, 
+                value=NULL)
+
+load.plot.ls=list()
+
+for (i in 1:length(levels(load$name))) {
+  
+  load.i=load[load$name==levels(load$name)[i], ]
+  
+  #print(load.i)
+  
+  load.i$var=reorder(load.i$var, load.i$value)
+  
+  #print(str(load.i))
+  
+  #load.or=rbind(load.or, load.i)
+  
+  p.i=ggplot(load.i)+
+    geom_point(aes(var, value), pch=21, col='black', 
+               fill='blue', alpha=0.7, size = 3)+
+    facet_grid(.~name)+
+    theme_bw()+
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+    geom_hline(yintercept = 0)+
+    ylim(-0.5, 0.5)+ 
+    geom_segment( aes(x=var, xend=var, y=0, yend=value))+
+    xlab('Variable')+ylab('Loading value')+
+  coord_flip()
+  
+  load.plot.ls[[i]]=p.i
+  #plot(p.i)
+}
+
+ggarrange(plotlist = load.plot.ls, ncol=3)
+
+
+```
+
+
+```{r latam.pc.1_3.map, results='hold'}
+
+latam.eu.map=ne_countries(continent = c('South America'), 
+                          scale = 'large', returnclass = 'sf') %>%
+  st_transform('+proj=utm +zone=21 +datum=WGS84 +units=m +no_defs ') %>% 
+  st_crop(extent(pc.latam.latam$map)[c(1, 3, 2, 4)] %>% 
+            `names<-`(c('xmin', 'ymin', 'xmax', 'ymax')))
+
+pc_map_list=list()
+
+min.fill.lims=c()
+max.fill.lims=c()
+
+for (i in 1:3) {
+  min.fill.lims[i]=min(pc.latam.latam$map[[i]][], na.rm = T)
+  max.fill.lims[i]=max(pc.latam.latam$map[[i]][], na.rm = T)
+  
+  pc_map_list[[i]]=ggplot()+
+    geom_raster(data=pc.latam.latam$map[[i]],
+                aes_string(x='x', y='y', fill=paste0('PC_', i)), show.legend = F)+
+    theme_void()+
+    #scale_fill_viridis(option = 'H', na.value = "white")+ 
+    scale_fill_distiller(palette = 'Spectral', na.value = 'white', 
+                         limits=c(min.fill.lims[i], max.fill.lims[i]))+
+    coord_equal()+
+    ggtitle(paste0('PC ', i))+
+    theme(legend.position = 'bottom', 
+          plot.title = element_text(hjust=0.5), 
+          plot.margin = unit(c(0, -1, -0.3, -1), 'cm'))+
+    labs(fill=NULL)+
+    geom_sf(data=latam.eu.map, alpha=0, col='grey20', size=0.1)
+}
+
+
+
+gg.pc.maps=ggarrange(plotlist=pc_map_list, ncol = 3)
+
+print(gg.pc.maps)
+
+```
+
+
+
+
+
+```{r B. terrestris data}
+
+# european ocurrences
+bter.eu.points=read.csv('./data/bter_eur.csv', 
+                 quote = "", sep='\t')
+bter.eu.points=data.frame(lon=bter.eu.points$decimalLongitude, 
+                   lat=bter.eu.points$decimalLatitude, 
+                   year=bter.eu.points$year)
+bter.eu.points=bter.eu.points[complete.cases(bter.eu.points),]
+bter.eu.points=unique(bter.eu.points)
+
+# european ocurrences rasterization
+
+## rasterization
+bter.eu.ras=rasterize(bter.eu.points[,1:2], pc.eu.from.latam$PC_1)
+
+## set all positive to 1
+bter.eu.ras[bter.eu.ras[]>=1]=1
+
+# extract coordinates of colonized cells
+bter.eu.coor=coordinates(bter.eu.ras)[!is.na(bter.eu.ras[])&
+                           bter.eu.ras[]==1, ]
+
+bter.eu=bter.eu.coor%>%as.data.frame()
+names(bter.eu)=c('lon', 'lat')
+
+```
+
+```{r B. terrestris prior niche modelling, message=FALSE, results='hold'}
+
+
+#pseudoabseces
+# heavy run
+
+
+pa.factor=10 # cantidad de background points en Europa
+
+pa.beter.eu=randomPoints(mask=pc.eu.from.latam, n=nrow(bter.eu)*pa.factor)%>%
+  as.data.frame()%>%`colnames<-`(c('lon', 'lat'))
+pa.beter.eu$type=0
+
+bter.eu$type=1
+
+oc.pa.beter.eu=rbind(pa.beter.eu, bter.eu[,c('lon', 'lat', 'type')])
+
+eu.oc.pc=raster::extract(pc.eu.from.latam, oc.pa.beter.eu[,c('lon', 'lat')])%>%
+  cbind(oc.pa.beter.eu)
+
+prior.niche=glm(eu.oc.pc, family = binomial(link='logit'),
+                formula = type~
+                  PC_1+ I(PC_1^2)+
+                  PC_2+ I(PC_2^2)+  
+                  PC_3+ I(PC_3^2)
+)
+
+coef=t(prior.niche$coefficients)%>%data.frame()
+
+conf=confint(prior.niche)
+
+#SEs=(coef-t(conf[,1]))/2
+SEs=coef-t(conf[,1])
+
+# plot europe ocurrences, prior suits and expl variables
+prior.niche.europe=predict(pc.eu.from.latam, prior.niche)%>%
+  invlogit()
+
+prior.niche.europe_df = prior.niche.europe %>% 
+  coordinates() %>%
+  as.data.frame() %>% 
+  bind(data.frame(fill=prior.niche.europe[]))
+
+prior.suit=predict(pc.latam.patag, prior.niche)%>%
+  invlogit()
+
+
+sd.prior.factor=5
+
+```
+
+
+La forma en la que estas variables se tuvieron en cuenta en la estimación de la suitabilidad ambiental -la función $S(A)$ mencionada previamente- fue mediante la construcción de un predictor lineal de segundo orden y una función de enlace $logit$.
+
+$$
+logit(S)=\beta_0+
+\beta_{11}PC_1+\beta_{12}PC_1^2+
+\beta_{21}PC_2+\beta_{22}PC_2^2+
+\beta_{31}PC_3+\beta_{32}PC_3^2
+$$
+
+donde $S$ es el factor de suitabilidad y los $\beta$ son parámetros a estimar a partir de los datos. Esta estimación sería equivalente a parametrizar el nicho climático de *B. terrestris*. Como la estrategia utilizada para la estimación de los parámetros es Bayesiana, es posible utilizar información previa sobre el nicho de esta especie. En este caso, es razonable considerar que la suitabilidad ambiental para la colonización por parte de *B. terrestris* en latinoamérica sea relativamente similar al nicho climático ocupado en su región de origen. Teniendo en cuenta esto, se utilizaron datos de ocurrencias de Europa para hacer una estimación aproximada de los valores *a priori* de cada $\beta$ mediante la aplicación de Modelos Lineales Generalizados (GLM). Para obtener las variables explicativas de este GLM se extrapoló el modelo de PCA construido con las variables bioclimáticas en Latinoamérica a la región europea. 
+
+```{r Europe PCs plots, fig.height=2.65, fig.width=6}
+
+#layout(matrix(1:3, ncol=3))
+#par(mar=c(3, 3, 3, 2))
+
+#for (i in 1:3) {
+#  plot(pc.eu.from.latam[[i]], 
+#       main=paste0('PC_', i))
+#}
+
+
+europe.map=ne_countries(continent = 'Europe', scale = 'large', returnclass = 'sf') %>% 
+  st_crop(extent(pc.eu.from.latam)[c(1, 3, 2, 4)] %>% 
+            `names<-`(c('xmin', 'ymin', 'xmax', 'ymax')))
+
+
+pc_map_list.eu=list()
+for (i in 1:3) {
+  pc_map_list.eu[[i]]=ggplot()+
+    geom_raster(data=projectRaster(pc.eu.from.latam[[i]], crs="+proj=utm +zone=31U +datum=WGS84"),
+                aes_string(x='x', y='y', fill=paste0('PC_', i)))+
+    theme_void()+
+    #scale_fill_viridis(option = 'H', na.value = "white")+ 
+    scale_fill_distiller(palette = 'Spectral', na.value = 'white', 
+                         limits=c(min.fill.lims[i], max.fill.lims[i]))+ 
+    coord_equal()+
+    #ggtitle(paste0('PC ', i))+
+    theme(legend.position = 'bottom', 
+          plot.title = element_text(hjust=0.5), 
+          plot.margin = unit(c(0, -1, 0, -1), 'cm'))+
+    labs(fill=NULL)+
+    geom_sf(data=europe.map, alpha=0, col='grey20', size=0.1)+
+   coord_sf(crs=st_crs("+proj=utm +zone=31U +datum=WGS84"))
+}
+
+
+
+gg.pc.maps.eu=ggarrange(plotlist=pc_map_list.eu, ncol = 3)
+
+#print(gg.pc.maps.eu)
+
+
+ggarrange(plotlist = list(gg.pc.maps, gg.pc.maps.eu), ncol=1, 
+          heights = c(1.2, 1) )
+
+#ggsave('plots/rasters.plots/pc.maps.png',  width = 13, height = 12, units = 'cm', dpi = 1000, device = 'png', bg = 'white')
+
+
+```
+
+
+```{r PCA maps 2, eval=F, include=F}
+
+
+pc.eu.df=pc.eu.from.latam[[1:3]] %>% as.data.frame()
+pc.eu.df$region='Europa'
+coords.eu.df=coordinates(pc.eu.from.latam$PC_1) %>% as.data.frame()
+pc.eu.df=cbind(pc.eu.df, coords.eu.df)
+
+pc.latam.df=pc.latam.latam$map[[1:3]] %>% as.data.frame()
+pc.latam.df$region='Sudamerica'
+coords.latam.df=coordinates(pc.latam.latam$map[[1]]) %>% as.data.frame()
+pc.latam.df=cbind(pc.latam.df, coords.latam.df)
+
+pc.all.df=rbind(pc.eu.df, pc.latam.df)
+
+
+pc.all.long.df=pivot_longer(pc.all.df, cols = 1:3)
+
+pc.all.long.df$name=pc.all.long.df$name %>% gsub('_', ' ', .)
+
+pc.all.long.df=as.data.frame(pc.all.long.df)
+
+ggplot(pc.all.long.df)+
+  geom_raster(aes(x, y, fill=value))+
+  coord_equal()+
+  scale_fill_distiller(palette = 'Spectral', na.value = 'white')+
+  facet_grid(region~name)+
+  theme_classic()
+
+
+
+```
+
+
+
+
+
+
+
+
+
+De estas capas se extrajeron los valores correspondientes a las `r sum(bter.eu$type==1)` celdas con registros de *B. terrestris* , y a una cantidad `r pa.factor` veces mayor de puntos muestreados aleatoriamente a modo de *background*. El predictor lineal del GLM se construyó de la misma manera que el planteado arriba para el modelo de suitabilidad, utilizando como variable respuesta el tipo de dato (*1 = ocurrecia, 0 = background*) y una función de enlace *logit*.
+
+```{r Europe ocurrences and niche plot, fig.align='center', dev='png', fig.ext='png'}
+
+eu.map.plot=ggplot()+
+  geom_raster(data=projectRaster(prior.niche.europe, 
+                                 crs="+proj=utm +zone=31U +datum=WGS84"), 
+              alpha=1, aes(fill=layer, x=x, y=y))+ 
+  #coord_equal()+
+  #scale_fill_continuous(na.value=NA)+
+  scale_fill_viridis(option = 'D', na.value = NA, direction = 1)+
+  labs(fill='Aptitud
+ambiental 
+a priori')+
+    geom_sf(data=europe.map, alpha=0, col='white', size=0.1)+
+  coord_sf(crs=st_crs("+proj=utm +zone=31U +datum=WGS84"))+
+  
+  new_scale_fill()+
+  scale_x_continuous(breaks=seq(-50, 70, 10))+
+  geom_raster(data=projectRaster(bter.eu.ras,
+                                 crs="+proj=utm +zone=31U +datum=WGS84"), 
+              alpha=0.9,
+              aes(x=x, y=y, fill=as.factor(layer)), show.legend =F)+
+  scale_fill_manual(values=c('red2'), na.value = NA)+
+  #annotate(geom="raster", x=bter.eu$lon, y=bter.eu$lat, alpha=1,
+  #         fill = scales::colour_ramp(c("transparent","red2"))(bter.eu$type))+
+  #geom_point(data=bter.eu, lwd=0.001, col='red', alpha=0.1)+
+  #theme_classic()+ 
+  theme_bw()+
+  #scale_fill_distiller(palette = 'Spectral', na.value = 'white')+
+  #scale_fill_gradientn(colours = terrain.colors(7), na.value = "white")+
+  #xlim(extent(prior.niche.europe)[1:2])+
+  xlab('Longitud')+ylab('Latitud')
+
+ggsave(filename = 'plots/rasters.plots/eu.ma.prior.png', plot=eu.map.plot, 
+       width = 15, height = 13, units = 'cm', dpi=1200, device = 'png', bg='white')
+
+```
+
+Los puntos negros corresponden a las coordenadas de las `r sum(bter.eu$type==1)` celdas con registros de *B. terrestris*.
+
+```{r GLM fit estimates, results='hold'}
+confint=as.data.frame(conf)
+confint$Estimate=t(coef[1,])
+
+confint=confint[,c(3, 1, 2)]
+
+library(knitr)
+kable(round(confint, 2), caption = 'GLM estimates')
+
+
+
+```
+
+Para moderar el grado de informatividad de las previas para estos parámetros, cada una de ellas se definió como una distribución normal con media igual al estimador puntual del GLM y desvío estándar igual a `r sd.prior.factor` veces la distancia entre el estimador y el límite inferior del intervalo de confianza de 95 % del mismo (percentil del 2.5 %).
+
+## Kernel de dispersión
+
+El modelo utilizado para el kernel de dispersión -la función $f(d)$ presentada previamente- es el siguiente:
+$$
+f(d)=\frac{e^\gamma}{d^{2}}
+$$
+Donde $d$ es la distancia entre celdas y $\gamma$ es un parámetro a ajustar con los datos.
+
+## Datos 
+
+
+```{r Patagonian BT currences data pre-processing}
+#setwd('./data')
+
+#### Abrahamovich y Diaz ####
+
+diaz<-read.csv('./data/external sources/diaz.txt', sep='\t')
+diaz$sp<-'Bombus dahlbomii'
+diaz$db='diaz'
+
+#### morales ####
+mor<-read.csv('./data/external sources/Morales_data.txt', sep='\t')
+
+bd.mor<-subset(mor, B.dahlbomii>=1)
+bd.mor<-bd.mor[,c("Longitude..W...decimal.degrees.", 
+                  "Latitude..S...decimal.degrees.")]
+bd.mor$year<-2011
+bd.mor$sp<-'Bombus dahlbomii'
+
+br.mor<-subset(mor, B.ruderatus>=1)
+br.mor<-br.mor[,c("Longitude..W...decimal.degrees.", 
+                  "Latitude..S...decimal.degrees.")]
+br.mor$year<-2011
+br.mor$sp<-'Bombus ruderatus'
+
+bt.mor<-subset(mor, B.terrestris>=1)
+bt.mor<-bt.mor[,c("Longitude..W...decimal.degrees.", 
+                  "Latitude..S...decimal.degrees.")]
+bt.mor$year<-2011
+bt.mor$sp<-'Bombus terrestris'
+
+morales<-rbind(bd.mor, br.mor, bt.mor)
+colnames(morales)<-c('lon', 'lat', 'year', 'sp')
+morales$db='Morales'
+
+#### idigbio ####
+
+idb<-read.csv('./data/external sources/occurrence_raw_idigbio.csv')
+idb2<-data.frame(lon=idb$dwc.decimalLongitude,
+                 lat=idb$dwc.decimalLatitude,
+                 year=idb$dwc.year, 
+                 sp=paste(idb$dwc.genus, idb$dwc.specificEpithet), 
+                 db='idb')
+
+#### SCAN ####
+
+scan<-read.csv('./data/external sources/occurrences_scan.csv')
+scan2<-data.frame(lon=scan$decimalLongitude,
+                  lat=scan$decimalLatitude,
+                  year=scan$year, 
+                  sp=paste(scan$genus, scan$specificEpithet), 
+                  db='scan')
+scan2<-subset(scan2, sp!=' ')
+
+
+
+#### GBIF ####
+#setwd('./external sources/gbif manual/')
+
+# Bombus dahlbomii
+# DOI 10.15468/dl.d4neky
+bd0<-read.csv('./data/external sources/gbif manual/dahlbomii/0316392-200613084148143.csv', 
+              sep='\t')
+#bd0<-read.csv('./dahlbomii/0138260-200613084148143.csv', sep='\t')
+
+bd<-data.frame(lon=bd0$decimalLongitude, 
+               lat=bd0$decimalLatitude, 
+               year=bd0$year, 
+               sp='Bombus dahlbomii')
+
+bd<-bd[complete.cases(bd),]
+
+
+# Bombus terrestris
+# DOI 10.15468/dl.ymkhwc
+
+bt0<-read.csv('./data/external sources/gbif manual/terrestris/0316394-200613084148143.csv', 
+              sep='\t')
+
+bt<-data.frame(lon=bt0$decimalLongitude, 
+               lat=bt0$decimalLatitude, 
+               year=bt0$year, 
+               sp='Bombus terrestris')
+bt<-bt[complete.cases(bt),]
+
+# Bombus ruderatus
+# DOI 10.15468/dl.urxqrj
+
+br0<-read.csv('./data/external sources/gbif manual/ruderatus/0316281-200613084148143.csv', 
+              sep='\t')
+
+br<-data.frame(lon=br0$decimalLongitude, 
+               lat=br0$decimalLatitude, 
+               year=br0$year, 
+               sp='Bombus ruderatus')
+br<-br[complete.cases(br),]
+
+
+
+# three species
+gbif<-rbind(bd, bt, br)
+gbif$db='gbif'
+
+
+#### schmid ####
+
+sch=read.csv('./data/external sources/schmith hempel 2014/sp.three.csv', 
+             sep='\t')
+
+sch=sch[sch$n>=1, c(3, 2, 1, 5)]
+sch[,1:2]=sch[,1:2]*(-1)
+sch$db='sch'
+
+colnames(sch)=colnames(diaz)
+
+# add introduction site from scmith hempel (Quillota, centarl Chile)
+sch=rbind(sch, list(lon=-71.14, lat=-32.52, year=1998, 
+                    sp='Bombus terrestris', db='sch'))
+
+
+
+#sch=sch[rep(row.names(sch), sch$n),c(3, 2, 1, 5)]
+#rownames(sch)=NULL
+
+
+
+#### all ####
+
+bind<-rbind(diaz, morales, idb2, scan2, gbif, sch)
+
+oc.pat.plot=ggplot(bind)+
+  geom_point(aes(lon, lat), alpha=0.3)+
+  geom_vline(xintercept = c(-60, -76))+
+  geom_point(data=bind[bind$lon>=68&bind$lon<=76,], 
+             aes(lon, lat), alpha=0.2, col='red')+
+  coord_equal()
+
+# espejar las antipodas
+bind[bind$lon>=68&bind$lon<=76,c('lon', 'lat')]=
+  (bind[bind$lon>=68&bind$lon<=76,c('lon', 'lat')])*(-1)
+
+# filtrar todo el resto (europa, oceania, etc..)
+bind=bind[bind$lon<=-60&bind$lon>=-76,]
+
+## Highly probably false ocurrences 
+lat.north.cut=-25
+
+n.removed=nrow(bind[!bind$lat<=lat.north.cut,])
+
+bind=bind[bind$lat<=lat.north.cut,]
+
+bind<-unique(bind) # remove duplications
+
+#bind=unique(bind[,1:4])
+
+cnt.raw=count(bind, db, sp)
+
+write.csv(row.names = F, bind, './bind_mor.diaz.scan.idb.gbif.csv')
+
+
+#setwd('../')
+
+```
+
+```{r Patg. BT ocs. formatting}
+## importation and formatting ####
+#all=read.csv("./data/bind_mor.diaz.scan.idb.gbif.csv")
+
+all=bind
+
+# dataframe formatting
+oc=all[all$sp=='Bombus terrestris'&
+         !is.na(all$year),]
+
+# introduction data
+int.site=c('Copiapó', 'Ovalle', 'San Felipe', 
+           'Quillota', 'Limache', 'Santiago', 'Los Ángeles')
+int.lat=c(-27.2, -30.36, -32.45, -32.5, 
+           -32.59, -33.27, -37.28)
+int.long=c(-70.19, -71.12, -70.43, -71.1, 
+          -71.17, -70.40, -72.21)
+
+int.df=data.frame(lon=int.long, 
+                  lat=int.lat, 
+                  year=1997,
+                  sp='Bombus terrestris', 
+                  db='Montalva_2011',
+                  site=int.site)
+
+
+oc=rbind(oc, int.df[,1:5])
+
+ll=oc[,c('lon', 'lat')]
+ll=SpatialPoints(ll)
+
+# geo projection
+# set starting long-lat crs
+crs(ll)=CRS("+proj=longlat +datum=WGS84")
+
+# new CRS
+#nproj="+proj=utm +zone=19H +datum=WGS84"
+
+ll.proj=spTransform(ll, CRS(nproj))
+
+ll.proj.df=as.data.frame(ll.proj)
+  
+
+bt=cbind(ll.proj.df, year=oc[,3])
+
+#mp=bt[,c('lon', 'lat', 'year')]
+```
+
+
+Los datos utilizados para ajustar el modelo de dispersión consistieron en ocurrencias de *B. terrestris* que contaran con información de sus coordenadas y fecha de registro, y los valores de las componentes principales 1, 2 y 3 en esas coordenadas (*después daré mas detalles sobre estos datos y sobre su obtención*). `r n.removed` ocurrencias fueron removidas del análisis ya que se encontraban en latitudes anómalamente altas (al norte de `r lat.north.cut` grados). Con el objetivo de representar de la manera más fidedigna posible las distancias geográficas entre las coordenadas de los registros se realizó, para todas las capas de información (tanto ocurrencias como variables climáticas), una proyección de Mercator Transversal (UTM, centrada en la zona 19) para pasar del sistema de referencia polar longitud-latitud a uno euclideo.
+
+```{r Rasterization of Patagonian ocurrences}
+
+mp=bt[,c('lon', 'lat', 'year')]
+
+y=as.factor(mp$year)
+
+cell.size=50000 # meters
+x.n.cells=round(abs(max(mp$lon)-min(mp$lon))/cell.size)
+y.n.cells=round(abs(max(mp$lat)-min(mp$lat))/cell.size)
+
+
+r=raster(ncol=x.n.cells, nrow=y.n.cells, ext=extent(ll.proj))
+r[]=1:length(r)
+
+rp=rasterize(x=as.matrix(mp[,1:2]), 
+             y=r)
+rp[rp>=1]=1
+
+# rasterizacion por anio
+s=list()
+for (i in 1:length(levels(y))) {
+  #print(i)
+  mp.i=mp[mp$year<=as.integer(levels(y)[i]),]
+  
+  rp.i=rasterize(x=as.matrix(mp.i[,1:2]), 
+                 y=r)
+  rp.i[rp.i>=1]=1
+  
+  s[[i]]=rp.i
+}
+s=stack(s)
+names(s)=levels(y)%>%as.character()
+
+
+# p/c/celda se queda con el 1er anio con registros
+C=c()
+#yl=1:nlayers(s)
+yl=levels(y)%>%as.character()%>%as.integer()
+
+for (i in 1:length(rp)) {
+  #print(i)
+  c.i=s[[1:nlayers(s)]][i]
+  if (all(is.na(c.i))) {
+    C[i]=NA
+  }else{
+    C[i]=yl[!is.na(c.i)]%>%min()
+  }
+}
+
+rp.y=rp
+rp.y[]=C
+
+## data visualization Figure A ####
+
+points=coordinates(rp.y)%>%as.data.frame()
+points$Year=rp.y[]
+points$Year=as.factor(points$Year)
+points=points[points$y<=extent(pc.latam.patag)[4],]
+
+ras.plot=rp.y#%>%crop(y=extent(pc.latam.patag))
+ras.plot[]=raster::extract(prior.suit, coordinates(ras.plot))
+
+#arg=raster::getData("GADM",country=c("Argentina"),level=0)
+#chl=raster::getData("GADM",country=c("Chile"),level=0)
+
+#arg.p=spTransform(arg, crs(nproj))%>%
+#  raster::crop(y=extent(ll.proj))%>%fortify()
+
+#chl.p=spTransform(chl, crs(nproj))%>%gSimplify(tol=1000)%>%
+#  raster::crop(y=extent(ll.proj))%>%fortify()
+
+map.ext.crop=extent(ll.proj)[c(1, 3, 2, 4)] %>% 
+  `names<-`(c('xmin', 'ymin', 'xmax', 'ymax')) %>% 
+  `+`(c(0, 0, 400000, 400000))
+
+map.states.chl.ar=ne_states(country = c('Chile', 'Argentina'), returnclass = 'sf')%>%
+  st_transform(nproj) %>% 
+  st_crop(map.ext.crop)
+
+map.countries.chl.ar=ne_countries(country = c('Chile', 'Argentina'), 
+                                  returnclass = 'sf', scale = 'large')%>%
+  st_transform(nproj) %>% 
+  st_crop(map.ext.crop)
+
+
+cell.coor=coordinates(rp.y)
+
+df=data.frame(i=1:length(C), Ti=C, 
+              xi=cell.coor[,1], yi=cell.coor[,2])
+df$c=NA
+df$c[is.na(df$Ti)]=0
+df$c[!is.na(df$Ti)]=1
+
+### add enviromental variables ####
+cov.expl.pcs=raster::extract(pc.latam.patag[[1:3]], df[,c('xi', 'yi')])
+
+# biocliamtic not used, only PCs
+#cov.expl.bio=raster::extract(expl.bio.pat.all[[c(1, 12)]], df[,c('xi', 'yi')])
+
+
+
+
+df=cbind(df, cov.expl.pcs)
+
+df=df[!is.na(df[,6:ncol(df)])%>%
+        as.matrix()%>%
+        rowSums()>=1, ]
+
+```
+
+
+```{r Data plot_white, fig.height=7, fig.width=3.5, results='hold', warning=FALSE, message=FALSE}
+
+cells=rasterToPolygons(rp.y) %>% 
+  st_as_sf() %>% 
+  `st_crs<-`(st_crs(map.states.chl.ar))
+
+#data.plot=
+p1=ggplot()+
+  #geom_raster(data=rp.y, aes(x, y, fill=as.factor(layer)), alpha=0.9)+
+  #theme(legend.position = "top", legend.direction = 'horizontal')+ 
+  coord_equal()+
+  scale_fill_viridis(option = 'B', direction=1, na.value = NA, 
+                     begin = 0.1, end=1, discrete = T)+ 
+  #scale_fill_distiller(palette = 'YlOrRd', na.value = 'white')+
+  theme_classic()+
+  #geom_point(data=points[!is.na(points$Year),], aes(x, y), size=2.5, col='black', pch=0)+
+  labs(fill = "Año del
+primer 
+registro")+xlab(NULL)+ylab(NULL)+
+  annotation_scale(bar_cols=c('grey50', 'white'))+
+  theme(axis.text.x = element_text(angle=90, vjust = 0.5), 
+        legend.text = element_text(size=9))+
+  geom_sf(data=map.states.chl.ar, fill='grey99', col='grey30')+
+  geom_sf(data=map.countries.chl.ar, fill='white', alpha=0, col='black', lwd=1.01)+
+  #geom_raster(data=rp.y, aes(x, y, fill=as.factor(layer)), alpha=0.95)+
+  geom_sf(data=cells, aes(fill=as.ordered(layer)), col='black')+
+  guides(fill=guide_legend(reverse = T, keyheight=0))
+  #geom_polygon(data=arg.p, aes(long, lat, group=group), alpha=0, col='black')+
+  #geom_polygon(data=chl.p, aes(long, lat, group=group), alpha=0, col='black')
+
+print(p1)
+
+ggsave('plots/rasters.plots/data.plot.png', plot=p1,
+       units = 'cm', width = 10, height = 15, 
+       dpi=500)
+```
+
+
+
+```{r Data plot BW, fig.height=7, fig.width=3.5, results='hold', eval=FALSE, include=F}
+
+#data.plot=
+p1=ggplot()+
+  geom_raster(data=ras.plot, aes(x, y, fill=layer), alpha=1)+
+  #theme(legend.position = "top", legend.direction = 'horizontal')+ 
+  coord_equal()+
+  scale_fill_viridis(option = 'viridis', na.value = "white")+
+  theme_void()+
+  geom_polygon(data=arg.p, aes(long, lat, group=group), alpha=0, col='black')+
+  geom_polygon(data=chl.p, aes(long, lat, group=group), alpha=0, col='black')+
+  geom_point(data=points[!is.na(points$Year),], aes(x, y), size=2.5, col='black')+
+  geom_point(data=points[!is.na(points$Year),], aes(x, y, col=Year), size=2)+
+  labs(col = "Year of first
+detection")+
+  labs(fill='Prior 
+enviromental
+suitability')+
+  theme(legend.box = "horizontal", 
+        legend.direction = "vertical", 
+        legend.position = 'left')+
+  scale_color_manual(values = hcl.colors(length(levels(points$Year)), 
+                                         palette = 'OrRd'))+
+  #xlim(extent(ras.plot)[1:2])+ylim(extent(ras.plot)[3:4])+
+  annotation_scale()
+
+
+
+guide_color=cowplot::get_legend(p1 + guides(fill = "none"))
+
+data.plot=cowplot::plot_grid(guide_color, p1 + guides(color = "none") + 
+                               theme(legend.position = "bottom", 
+                                     legend.direction = 'horizontal'), 
+                             ncol = 2, rel_widths = c(1, 3))
+
+print(data.plot)
+```
+
+En el gráfico se muestran los valores de suitabiidad *a priori* en forma de raster para ilustrar la escala de las celdas. Las celdas con puntos son aquellas en las que se registraron ocurrencias, y el color de los mismos indica la fecha más temprana de registro.
+
+## Parametrización
+
+Para estimar todos los parámetros se programó un algoritmo de Markov Chain Monte Carlo (MCMC) que recorra el espacio multidimensional de parámetros, generando de esta forma una muestra de la distribución posterior conjunta (multivariada). Este algoritmo propone, en cada iteración de la cadena, un nuevo punto en este espacio multivariado y calcula un valor proporcional a la probabilidad posterior conjunta en el mismo, multiplicando el valor de la previa por el likelihood. Es un valor proporcional, y no absoluto, porque no se calcula la probabilidad total de los datos (ya que esto requeriría integrar el likelihood a lo largo de todo el espacio de parámetros, lo que en este caso es computacionalmente inviable). Sin embargo, esto no significa un problema, ya que lo que interesa es el cociente entre este valor calculado en el nuevo punto propuesto y el valor en el punto inmediatamente anterior en la cadena. Este cociente se utiliza para evaluar un algoritmo de aceptación-rechazo del tipo *Metropolis-Hastings*. De esta forma, cuando el número de iteraciones es grande, el conjunto de puntos de la cadena se aproxima muy bien a la distribución posterior conjunta.
+
+```{r Likelihood and MCMC functions}
+# functions definition ####
+
+likelihood.func=function(data, pars, cov.names){
+  
+  # list of parameters of climatic covariables
+  cov.pars=pars$cov.pars
+  
+  ## distances matrix
+  data$i=1:nrow(data)
+  
+  d=dist(data[,c('xi', 'yi')], upper = T)%>%
+    as.matrix()
+  
+  # splitting colonized cells from un-colonized
+  data_1=data[data$c==1,]
+  
+  data_0=data[data$c==0,]
+  
+  # distances matrix of colonized cells
+  d1=dist(data_1[,c('xi', 'yi')], upper = T)%>%
+    as.matrix()
+  
+  
+  # environmental suitability computation
+  # each row corresponds to a single cell
+  
+  ## matrix of linear and quadratic coefficients
+  betas=cov.pars[2:length(cov.pars)]%>%
+    unlist()%>%
+    rep(nrow(data))%>%
+    matrix(byrow = T, nrow=nrow(data))
+  
+  ## matrix of environmental variables
+  Xs=data[,rep(cov.names, rep(length(terms), length(cov.names)))]%>%
+    as.matrix()
+  
+  ## matriz de exponentes a los cuales elevar las variable ambientales
+  ## terms es un vector c(1, 2), por lineal y cuadratico
+  ## tomado del scope general (asi funciona... no tocar)
+  exponents=rep(terms, length(cov.names))%>%
+    rep(nrow(data))%>%
+    matrix(byrow = T, nrow=nrow(data))
+  
+  ## suitability components matrix (each linear and quadratic contribution)
+  suit.mat=betas*(Xs^exponents)
+  
+  ## vector of integrated linear predictions (one elemnt per cell)
+  suit.vec.linear=rowSums(suit.mat)+pars$cov.pars$b0
+  
+  ## vector of integrated suitabilities (one elemnt per cell)
+  suit.vec.invlogit=invlogit(suit.vec.linear)
+  
+  
+  
+  
+  # matriz de componente espacial de flujos entre celdas dado un valor de gamma
+  ## corresponde a la imagen de f() en la formula del texto principal
+  ## aca phi es usado solo como la componente de dispersion (no es equivalente al phi del texto)
+  
+  phi.mat.1 = d1^(-2) * exp(pars$gamma)
+  
+  # computes for all cells the phi value but only for propagules coming from colonized cells 
+  #(computation economy)
+  phi.mat.all = matrix(NA, ncol=ncol(d), nrow=nrow(d))
+  phi.mat.all[,data$c==1] = d[,data$c==1]^(-2) * exp(pars$gamma)
+  
+  
+  # list of likelihoods for all cells i \in C (ie. colonized group)
+  Lik_vec_1=c()
+  
+  for (i in 1:nrow(data_1)) {
+    
+    # vector filtro (boolean) de celdas colonizadas antes que la celda i
+    J=data_1$Ti<data_1$Ti[i]
+    
+    d.i=d1[i,J] # distances vector (row of dist matrix)
+    
+    Ts=data_1[J, c('Ti')]
+    
+    T.i=data_1[i, c('Ti')]-Ts # vector de deltas T
+    
+    # computation of rate phi in cell i
+    phi.i_d=phi.mat.1[i, J] # dispersion component
+    phi.i=phi.i_d * suit.vec.invlogit[data_1$i[i]] # both components product
+    
+    
+    # likelihoods for all contributing cells j (given a Poisson process)
+    Li=sum(phi.i)*exp(-1*sum(phi.i*T.i)) 
+    
+    Lik_vec_1[i]=Li
+  }
+  
+  
+  Lik_vec_1[Lik_vec_1<=0]=1e-100 # to avoid log() errors
+  
+  joint_log.lik_1=sum(log(Lik_vec_1), na.rm = T)
+  
+  
+  Lik_vec_0=c()
+  
+  for (i in 1:nrow(data_0)) {
+    #print(i)
+    
+    J=data$c==1
+    
+    row.index.0=data_0$i[i]
+    
+    d.i=d[row.index.0,J] # distances vector
+    
+    T.i=max(data$Ti, na.rm = T)-data[J, c('Ti')] # vector de deltas T
+    
+    #suit.i=data_0[i, 'suit']
+    
+    # computation of rate phi in cell i
+    
+    phi.i_d=phi.mat.all[row.index.0, J]
+    
+    # debug
+    if (all(phi.i_d == phi.i_d)) {
+      #print('ok')
+    }else{
+      #print(matrix(c(phi.i_d, phi.i_d2), ncol=2))
+    }
+    
+    
+    phi.i=phi.i_d * suit.vec.invlogit[data_0$i[i]] 
+    
+    
+    Li= exp(-1*sum(phi.i*T.i)) 
+    
+    Lik_vec_0[i]=Li
+    
+  }
+  
+  Lik_vec_0[Lik_vec_0<=0]=1e-100 # to avoid log() errors
+  
+  
+  
+  joint_log.lik_0=sum(log(Lik_vec_0), na.rm = T)
+  
+  joint_1n0_log.lik = joint_log.lik_1 + joint_log.lik_0
+  
+  return(joint_1n0_log.lik)
+}
+
+
+
+# obsolete, not used (uses only colonized cells)
+likelihood.func_col.only=function(data, pars, cov.names){
+  
+  cov.pars=pars$cov.pars
+  
+  ## distances matrix
+  data$i=1:nrow(data)
+  
+  #print('sd')
+  d=dist(data[,c('xi', 'yi')], upper = T)
+  #print(d)
+  
+  d=as.matrix(d)
+  
+  # splitting colonized cells from uncolonized
+  data_1=data[data$c==1,]
+  
+  data_0=data[data$c==0,]
+  
+  # ditances matrix of colonized cells
+  
+  d1=dist(data_1[,c('xi', 'yi')], upper = T)%>%as.matrix()
+  
+  ## colonization functions
+  
+  # colonization rate from a cell at a distance d (vectorization is compatible)
+  # obsolete function
+  fd=function(d, l){ # f(d_ij)
+    y=l^2*d^(-2*l) # power law dispersal kernel
+    return(y)
+  }
+  
+  # colonizability of a cell given covariables values
+  # obsolete function
+  fa=function(x, cov.names, cov.pars){
+    y_=c()
+    
+    # non intercept parameters
+    non.int.pars=cov.pars[2:length(cov.pars)]%>%
+      unlist()
+    
+    env=x[,cov.names]
+    env=rep(env, rep(length(terms), length(env)))%>%unlist()
+    
+    exponents=rep(terms, length(cov.names))
+    
+    y_=non.int.pars*(env^exponents)
+    
+    y=sum(y_)+cov.pars$b0
+    out=arm::invlogit(y)
+    return(out)
+  }
+  
+  
+  # matrix aproach for enviromental suitability computation
+  
+  betas=cov.pars[2:length(cov.pars)]%>%
+    unlist()%>%
+    rep(nrow(data))%>%
+    matrix(byrow = T, nrow=nrow(data))
+  
+  Xs=data[,rep(cov.names, rep(length(terms), length(cov.names)))]%>%
+    as.matrix()
+  
+  exponents=rep(terms, length(cov.names))%>%
+    rep(nrow(data))%>%
+    matrix(byrow = T, nrow=nrow(data))
+  
+  suit.mat=betas*(Xs^exponents)
+  
+  suit.vec.linear=rowSums(suit.mat)+pars$cov.pars$b0
+  
+  suit.vec.invlogit=invlogit(suit.vec.linear)
+  
+  
+  
+  # matrix aproach for colonization rates computation
+  
+  phi.mat.1 = d1^(-2) * exp(pars$gamma)
+  
+  # computes for all cells the phi value but only from colonized cells 
+  #(computation economy)
+  phi.mat.all = matrix(NA, ncol=ncol(d), nrow=nrow(d))
+  phi.mat.all[,data$c==1] = d[,data$c==1]^(-2) * exp(pars$gamma)
+  
+  
+  # list of likelihoods for all cells i \in C
+  Lik_vec_1=c()
+  
+  for (i in 1:nrow(data_1)) {
+    
+    J=data_1$Ti<data_1$Ti[i]
+    
+    d.i=d1[i,J] # distances vector (row of dist matrix)
+    
+    Ts=data_1[J, c('Ti')]
+    
+    T.i=data_1[i, c('Ti')]-Ts # vector de deltas T
+    
+    #suit.i=data_1[i, 'suit']
+    
+    #if (is.na(suit.i)) {message('na suit')}
+    
+    # computation of rate phi in cell i
+    
+    
+    phi.i_d=phi.mat.1[i, J]
+    
+    
+    phi.i=phi.i_d * suit.vec.invlogit[data_1$i[i]] # * phi.i_a 
+    
+    # debug
+    if (any(is.na(phi.i))) { message('na phi.i') }
+    
+    Li=sum(phi.i)*exp(-1*sum(phi.i*T.i)) # likelihoods for all cell j (assuming Poisson process)
+    
+    Lik_vec_1[i]=Li
+  }
+  
+  Lik_vec_1[Lik_vec_1<=0]=1e-100
+  
+  joint_log.lik_1=sum(log(Lik_vec_1), na.rm = T)
+  
+  joint_1n0_log.lik = joint_log.lik_1
+  
+  return(joint_1n0_log.lik)
+}
+
+# mcmc chains
+mc=function(data, init.pars, sd.jump, cov.names,
+            likelihood.func, niter, 
+            priors.func, prior.means, prior.st.errs, 
+            multivar){
+  
+  parnames=unlist(init.pars)%>%names()
+  
+  prior.func.vec=unlist(priors.func)
+  prior.means.vec=unlist(prior.means)
+  prior.st.errs.vec=unlist(prior.st.errs)
+  
+  joint.prior=function(pars.vec, prior.func.vec, 
+                       prior.means.vec=prior.means.vec, 
+                       prior.st.errs.vec=prior.st.errs.vec){
+    # vector of priors for each parameter value
+    p.vec=c()
+    
+    pars.vec=unlist(pars.vec)
+    
+    for (i in 1:length(parnames)) {
+      
+      f=prior.func.vec[[parnames[i]]]
+      p.vec[i]=f(x=pars.vec[[parnames[i]]], 
+                 mean=prior.means.vec[[parnames[i]]], 
+                 se=prior.st.errs.vec[[parnames[i]]])
+    }
+    
+    # joint posterior (sum since log values are returned from prior functions)
+    jp=sum(p.vec)
+    return(jp)
+  }
+  
+  # empty matrix to fill with parameters sample
+  sims=matrix(NA, ncol = length(parnames), nrow = niter)
+  colnames(sims)=parnames
+  
+  # empty vector to fill with computed posteriors 
+  # (not actually posteriors since its not divided by data's probability)
+  pos=numeric(niter)
+  
+  # set initial values of parameters
+  sims[1,]=unlist(init.pars)
+  
+  # compute initial posterior
+  # likelihood
+  lik.1=likelihood.func(pars=init.pars, data=data, cov.names = cov.names)
+  
+  # joint prior
+  prior.1=joint.prior(pars.vec=init.pars, prior.func.vec = prior.func.vec, 
+                      prior.means.vec=prior.means.vec, 
+                      prior.st.errs.vec=prior.st.errs.vec)
+  
+  # joint posterior (sum since log values are used for both likelihoods and priors)
+  pos[1]=lik.1+prior.1
+  
+  # vector of jump standar deviations for each parameter
+  sd.jump.vec=unlist(sd.jump)
+  
+  for (i in 2:niter) {
+    message(paste0('iter ', i))
+    
+    # first set parameter values and posterior of the iteration to i-1 values
+    sims[i,]=sims[i-1,]
+    pos[i]=pos[i-1]
+    
+    # then run accept-reject algorithm switching one parameter at the time 
+    # (one dimentional jumping)
+    
+    new.par.set=sims[i-1,]
+    for (j in 1:length(parnames)) {
+      
+      # choose a new value for parameter j
+      new.par.j=rnorm(1, sims[i-1, j], sd = sd.jump.vec[j])
+      
+      # define the new parameter set
+      #new.par.set=sims[i-1,]
+      new.par.set[j]=new.par.j
+      
+      new.pars=relist(new.par.set, skeleton = init.pars)
+      
+      
+      if (multivar) {
+        if (j==length(parnames)) { # multivariate jump
+        
+        # new likelihood
+        new.lik=likelihood.func(pars=new.pars, data=data, cov.names = cov.names)
+        
+        # new prior
+        new.prior=joint.prior(pars.vec = new.pars, 
+                              prior.func.vec = prior.func.vec, 
+                              prior.means.vec=prior.means.vec, 
+                              prior.st.errs.vec=prior.st.errs.vec)
+        
+        # evaluate the posterior
+        new.pos=new.lik+new.prior
+        #print(new.pos)
+        
+        # probability of jumping to new value
+        prob.jump=min(1, exp(new.pos-pos[i-1]))
+        #print(prob.jump)
+        
+        
+        jump=rbinom(1, 1, prob.jump)
+        #print(jump)
+        
+        # execute the jump
+        if (jump==1) {
+          sims[i,]=new.par.set
+          pos[i]=new.pos
+          }
+        }
+      }else{ # jumps in each parameter iteratively
+        
+        # new likelihood
+        new.lik=likelihood.func(pars=new.pars, data=data, cov.names = cov.names)
+        
+        # new prior
+        new.prior=joint.prior(pars.vec = new.pars, 
+                              prior.func.vec = prior.func.vec, 
+                              prior.means.vec=prior.means.vec, 
+                              prior.st.errs.vec=prior.st.errs.vec)
+        
+        # evaluate the posterior
+        new.pos=new.lik+new.prior
+        #print(new.pos)
+        
+        # probability of jumping to new value
+        prob.jump=min(1, exp(new.pos-pos[i-1]))
+        #print(prob.jump)
+        
+        
+        jump=rbinom(1, 1, prob.jump)
+        #print(jump)
+        
+        # execute the jump
+        if (jump==1) {
+          sims[i, j]=new.par.j
+          pos[i]=new.pos
+        }
+      }
+    }
+  }
+  # define output
+  #samples.df=as.data.frame(sims)
+  
+  ls.out=list(posteriors=pos, samples=as.data.frame(sims))
+  return(ls.out)
+}
+```
+
+```{r Pars definition}
+
+## init values ####
+
+cov.names=c('PC_1', 'PC_2', 'PC_3')
+
+## terms of polinomic coefficients (3 = quadratic)
+order=2
+
+terms=1:order
+
+## list of params by covariable
+# te values will be modified when running chains
+cov.pars=list()
+for (i in 1:length(cov.names)) {
+  cov.pars.i=list()
+  
+  for (j in 1:length(terms)) {
+    cov.pars.i[[j]]=0 # setting init parameters values to 0
+  }
+  names(cov.pars.i)=paste0('b', terms)
+  
+  cov.pars[[i]]=cov.pars.i
+}
+names(cov.pars)=cov.names
+cov.pars$b0=0
+cov.pars=cov.pars[c(length(cov.pars), 1:(length(cov.pars)-1))]
+
+lambda=0
+gamma=0
+
+pars=list(gamma, cov.pars)
+names(pars)=c('gamma', 'cov.pars')
+
+```
+
+```{r Priors and chain jumps definition}
+
+## priors ####
+
+
+
+priors=pars
+
+# means and SEs
+prior.means=relist(coef, cov.pars)
+prior.means=list(#lambda=0.5, 
+                 gamma=0, cov.pars=prior.means)
+
+prior.st.errs=relist(SEs*sd.prior.factor, cov.pars)
+prior.st.errs=list(#lambda=2, 
+                   gamma=15, cov.pars=prior.st.errs)
+
+# functions
+
+#priors$lambda=function(x, mean, se){
+#  p=dtruncnorm(x=x, a=0, b=Inf, mean = mean, sd=se)
+  #p=1
+#  return(log(p))
+#}
+
+priors$gamma=function(x, mean, se){
+  p=dnorm(x=x, mean = mean, sd=se, log = T)
+  #p=1
+  return(p)
+}
+
+priors$cov.pars$b0=function(x, mean, se){
+  p=dnorm(x=x, mean = mean, 
+          sd=se, log = T)
+  #p=1
+  return(p)
+}
+
+# priors of cov.pars are defined below
+
+## jumps ####
+
+jumps=pars
+
+jumps$gamma=0.1
+#jumps$lambda=0.01
+jumps$cov.pars$b0=1.7
+# the rest of non-intercept cov.pars were defined all at once with the priors 
+
+
+# for the terms
+for (i in 1:length(cov.names)+1) {
+  for (j in 1:length(terms)) {
+    
+    #jumps$cov.pars[[i]][j]=0.03
+    jumps$cov.pars[[i]][j]=0.02
+    
+    if (j==2) {
+      jumps$cov.pars[[i]][j]=jumps$cov.pars[[i]][[j]]/2
+    }
+    
+    pars$cov.pars[[i]][j]=relist(coef, cov.pars)[[i]][j]
+    
+    priors$cov.pars[[i]][[j]]=function(x, mean, se){
+      
+      p=dnorm(x=x, mean = mean, 
+              sd=se, log = T)
+      #p=1
+      return(p)
+    }
+  }
+}
+
+
+jumps$cov.pars$PC_1$b1=jumps$cov.pars$PC_1$b1*9
+jumps$cov.pars$PC_1$b2=jumps$cov.pars$PC_1$b2*2
+jumps$cov.pars$PC_2$b1=jumps$cov.pars$PC_2$b1*4
+jumps$cov.pars$PC_2$b2=jumps$cov.pars$PC_2$b2*2
+jumps$cov.pars$PC_3$b1=jumps$cov.pars$PC_3$b1*3
+jumps$cov.pars$PC_3$b2=jumps$cov.pars$PC_3$b2*3
+
+```
+
+```{r MCMC run parameters}
+
+Niter=30000
+n.chains=3
+
+# min-max runif range to shuffle from central init.pars values (defined above)
+init.shuffle=5
+
+# only colonized cells
+col.only=F
+
+# Numeric index saved locally to identify different runs
+
+run.index=readRDS('./intermediate_files/run.index.RDS')
+
+# a prior rds file path. To be modified if new MCMC is run
+chain.list.file.path=paste0('./intermediate_files/chain.list', 
+                            '_prior.factor.', sd.prior.factor,
+                            '_pa.factor.', pa.factor, 
+                            '_Niter.', Niter, 
+                            '_nchains.', n.chains, 
+                            '_idx.', run.index, 
+                            '_col.only-', as.character(col.only), 
+                            '.RDS')
+
+```
+
+
+```{r Chains running and exporting, eval=mcmc.exec, message=FALSE}
+
+# run if eval=T in chunk parameters
+
+
+if (col.only) {
+  lik.f=likelihood.func_col.only
+}else{
+  
+  lik.f=likelihood.func
+}
+
+if (mcmc.exec==T) {
+  
+  
+  
+  chain.ls=list()
+  for (ch in 1:n.chains) {
+    
+    # define a new random starting points between -10 and 10
+    pars0=(unlist(pars)+runif(1, -init.shuffle, init.shuffle))%>%
+      relist(skeleton = pars)
+    
+    sim.ch=mc(data=df, init.pars = pars0,
+         sd.jump = jumps, likelihood.func = lik.f,
+         priors.func = priors, cov.names = cov.names, 
+         prior.means=prior.means, prior.st.errs=prior.st.errs, 
+         niter = Niter, multivar=F)
+    
+    sam.ch=sim.ch$samples
+    sam.ch$chain=ch
+    sam.ch$iter=1:Niter
+    
+    chain.ls[[ch]]=sam.ch
+  }
+  
+  run.index=run.index+1
+  saveRDS(run.index, file = './intermediate_files/run.index.RDS')
+  
+  # update rds file path
+  chain.list.file.path=paste0('./intermediate_files/chain.list', 
+                            '_prior.factor.', sd.prior.factor,
+                            '_pa.factor.', pa.factor, 
+                            '_Niter.', Niter, 
+                            '_nchains.', n.chains, 
+                            '_idx.', run.index, 
+                            '_col.only-', as.character(col.only), 
+                            '.RDS')
+  
+  # export RDS chain.list
+  saveRDS(chain.ls, file=chain.list.file.path)
+  
+}
+
+```
+
+```{r Chains importing and diagnosis}
+
+# import last chain list file
+
+
+#chain.ls=readRDS('./intermediate_files/chain.list_20000.iters_3.chs_41.RDS')
+chain.ls=readRDS(chain.list.file.path)
+
+# convergence check
+
+burnin=3000
+
+# delete burnin
+iter.chain.vars.out=function(x){
+  x1=x[-(1:burnin),!colnames(x)%in%c('iter', 'chain')]
+  return(x1)
+}
+
+sam.mat=chain.ls[1:length(chain.ls)]%>%
+  lapply(iter.chain.vars.out)%>%
+  lapply(as.matrix)%>%
+  lapply(mcmc)
+
+sam.coda=mcmc.list(sam.mat)
+
+#gelman.plot(sam.coda)
+Neff=effectiveSize(sam.coda)
+rej.rate=rejectionRate(sam.coda)
+#traceplot(sam.coda)
+summ=summary(sam.coda)
+summ.st=summ$statistics%>%as.data.frame()%>%round(2)
+summ.q=summ$quantiles%>%as.data.frame()%>%round(2)
+#autocorr.plot(sam.coda)
+
+summ.mcmc=data.frame(`Prior_m`=unlist(prior.means), 
+                     `Prior_sd`=unlist(prior.st.errs),
+                     `Jumps_sd`=unlist(jumps),
+                     `Neff`=round(Neff),
+                     `Reject.rate`=round(rej.rate, 3), 
+                     Post_m=summ.st$Mean, 
+                     q_2.5=summ.q$`2.5%`, 
+                     q_97.5=summ.q$`97.5%`)
+if (n.chains>=2) {
+  rhat=gelman.diag(sam.coda)
+  summ.mcmc$Rhat=rhat$psrf[,1]
+}
+
+
+chain.df=do.call('rbind', chain.ls)
+
+
+sam=gather(chain.df, par, value, 
+           names(chain.df)[!names(chain.df)%in%c('iter', 'chain')])
+
+chain.file.path=paste0(chain.list.file.path, 'dataframe.csv')
+
+# export chains in tabular format
+write.csv(sam, chain.file.path, row.names = F)
+```
+
+En este caso se corrieron `r n.chains` cadenas en paralelo, cada una con una longitud de `r format(Niter, scientific=FALSE)` iteraciones, descartando las primeras `r burnin` para no considerar el periodo de acercamiento de las cadenas a su estado estable (*burnin*). Los valores iniciales de cada parámetro en las diferentes cadenas se definieron aleatoriamente con probabilidad uniforme entre `r -init.shuffle` y `r init.shuffle`. La muestra utilizada corresponde a la unión de las `r n.chains` cadenas (descartando de cada una el intervalo de *burnin*).
+
+```{r Neff and rejection rates report, results='hold'}
+kable(round(summ.mcmc, 3))
+```
+
+La convergencia de las cadenas se evaluó manualmente mediante el análisis visual de los *trace-plots*:
+
+```{r Chains trace plot, fig.height=6, fig.width=6, dev='png', fig.ext='png'}
+
+sam=read.csv(chain.file.path)
+sam$chain=as.factor(sam$chain)
+
+
+sam.b=sam
+
+
+sam.b$par=sam.b$par%>%
+  gsub('cov.pars.', '', .) %>% 
+  gsub('_', '', .)
+
+sam.b.1=sam.b[sam.b$iter<=7000,]
+
+chain.plot=ggplot(sam.b.1)+
+  geom_line(aes(iter, value, col=chain), 
+            alpha=0.8, size=0.2, 
+            show.legend = F)+
+  facet_grid(par~., scales = 'free_y')+
+  xlab('Iteración')+
+  ylab('Valor del parámetro')+
+  #xlim(c(5000, 5500))+
+  theme_classic()+
+  geom_vline(xintercept = c(burnin), col='black', lwd=1.2, alpha=0.5)+
+  scale_color_brewer(palette = 'Set1')+
+  theme(axis.text.x = element_text(angle=90, vjust = 0.8))
+
+
+sam.b=sam.b[sam.b$iter>burnin,]
+
+chain.plot.2=ggplot(sam.b)+
+  geom_line(aes(iter, value, col=chain), 
+            alpha=0.8, size=0.2, 
+            show.legend = F)+
+  facet_grid(par~., scales = 'free_y')+
+  xlab('Iteración')+
+  ylab('')+
+  #xlim(c(5000, 5500))+
+  theme_classic()+
+  #geom_vline(xintercept = burnin, col='black', lwd=1.5, alpha=0.5)+
+  scale_color_brewer(palette = 'Set1')+
+  theme(axis.text.x = element_text(angle=90, vjust = 0.5))+
+  scale_x_continuous(breaks = seq(0, 30000, by=2000))
+
+
+traceplot.arr=ggarrange(plotlist = list(chain.plot, chain.plot.2), 
+          ncol=2, widths = c(1, 2))
+
+
+ggsave('plots/rasters.plots/traceplot.arr.png', plot=traceplot.arr,
+       units = 'cm', width = 16.5, height = 17, 
+       dpi=500)
+
+
+```
+
+```{r Chains reshaping for plotting}
+sam.w=reshape(sam.b, idvar = c("iter", 'chain'), 
+              timevar = "par", direction = "wide")
+
+names=names(sam.w)
+names.c=gsub(pattern = 'value.', replacement = '', x = names)%>%
+  gsub(pattern = 'cov.pars.', replacement = '')
+names(sam.w)=names.c
+```
+
+Evaluación del grado de correlación entre parámetros
+```{r Scatter matrix, fig.height=7, fig.width=7, results='hide', message=FALSE, include=F, eval=F}
+#plot(sam.w[sam.w$chain==1&sam.w$iter>=49000 ,3:10])
+
+adwfsadsfv=ggpairs(sam.w[sam.w$chain==1&
+             sam.w$iter>=Niter-1000 ,3:10], aes(alpha=0.5), 
+        upper = list(continuous='blank'))
+
+```
+
+
+
+En cuanto a las previas utilizadas, estas han sido la principal contribución a las distribuciones posteriores de algunos de los parámetros de los términos lineales y cuadráticos asociados a las variables ambientales ($\vec{\beta}$), pero no para todos; así como tampoco para $\gamma$.
+
+```{r Prior-posts distribution plots, fig.height=5, fig.width=7}
+
+prior.dists.plots=list()
+
+
+for (i in 1:length(unlist(pars))) {
+  
+  mean=unlist(prior.means)[i]
+  sd=unlist(prior.st.errs)[i]
+  func=unlist(priors)[[i]]
+  
+  x=seq(mean-5*sd, mean+5*sd, by=sd/1000)
+  
+  d=func(x=x, mean=mean, se=sd)%>%exp()
+  
+  prior.df.i=data.frame(x=x, d=d, par=names(unlist(pars))[i])
+  
+  
+  if (names(unlist(pars))[i]=='gamma') {
+    plot=ggplot(prior.df.i)+
+      #geom_ribbon(aes(x, ymax=d, ymin=0), alpha=0.1)+
+      theme_bw()+
+      xlab(expression(gamma))+
+      geom_density(data=sam.w,
+                   aes_string(names(sam.w)[i+2]), 
+                   fill='grey', alpha=0.6)+
+      geom_line(aes(x, d), col='red', size=0.7)+
+      ylab('')+
+      xlim(c(15, 20))
+  }else if(F){
+    plot=ggplot(prior.df.i)+
+      #geom_ribbon(aes(x, ymax=d, ymin=0), alpha=0.1)+
+      theme_bw()+
+      xlab(names(sam.w)[i+2])+
+      geom_density(data=sam.w,
+                   aes_string(names(sam.w)[i+2]), 
+                   fill='grey', alpha=0.6)+
+      geom_line(aes(x, d), col='red', size=0.7)+
+      xlim(c(0, 1.2))+ylab('')
+  }else{
+    plot=ggplot(prior.df.i)+
+      #geom_ribbon(aes(x, ymax=d, ymin=0), alpha=0.1)+
+      theme_bw()+
+      xlab(names(sam.w)[i+2])+
+      geom_density(data=sam.w,
+                   aes_string(names(sam.w)[i+2]), 
+                   fill='grey', alpha=0.6)+
+      geom_line(aes(x, d), col='red', size=0.7)+
+      #xlim(c(5, 20))+
+      ylab('')
+  }
+  prior.dists.plots[[i]]=plot
+}
+
+
+arr=ggarrange(plotlist=prior.dists.plots)
+
+# Annotate the figure by adding a common labels
+prior.post=annotate_figure(arr, left = text_grob("Densidad", rot = 90))
+
+print(prior.post)
+
+ggsave(filename = 'plots/rasters.plots/prior.post.png', plot=prior.post,
+       height = 13, width = 16, units = 'cm', dpi = 1000, device = 'png', bg = 'white')
+
+```
+
+Las líneas rojas corresponden a las densidades de probabilidad *a priori*, y las curvas grises son las densidades posteriores.
+
+## Visualización del kernel de dispersión
+
+En un proceso de Poisson, la probabilidad de no observar presencias en una celda dada una tasa de colonización es 
+$$
+P(0)=e^{-\phi T}
+$$
+donde $\phi$ es la tasa de colonización y $T$ es el intervalo de tiempo considerado. Considerando un período de un año, y una suitabilidad ambiental $S=1$, la probabilidad de colonización desde una celda a una distancia $d$ se puede calcular como
+
+$$
+P(1)=1-P(0)=1-e^{-\frac{e^\gamma}{d^2}}
+$$
+Teniendo en cuenta esto, se tomó toda la muestra de la posterior conjunta para calcular la probabilidad de colonización de una celda a otra, luego de un año de dispersión, a a diferentes distancias.
+
+```{r ker.plot generation}
+pc1y=function(l=1, gam, d){
+  phi=l^2 * d^(-2*l) *exp(gam)
+  
+  p0=exp(-1*phi)
+  p1=1-p0
+  
+  return(p1)
+}
+
+#ker.plot.sample=length(gammas)
+ker.plot.sample=1000
+
+# vectors of distances and parameters
+dists=seq(100, 50000, 100)
+
+#lambdas=sam.w$lambda
+gammas=sam.w$gamma
+
+# matrix of colonization at 1 year probability
+p=matrix(NA, ncol = ker.plot.sample, nrow = length(dists))
+
+
+
+for (i in 1:length(dists)) {
+  
+  for (j in 1:ker.plot.sample) {
+    
+    f=pc1y(#l=lambdas[j], 
+           d=dists[i], gam=gammas[j])
+    p[i,j]=f
+    
+  }
+}
+
+# put matrix values in dataframe
+
+col.prob.dist=data.frame(dist=NA, 
+                         p_2.5=NA, 
+                         p_97.5=NA, 
+                         p_median=NA)
+
+cred.int=c(0.01, 0.99)
+cred.int.level=100*(cred.int[2]-cred.int[1])
+
+for (i in 1:length(dists)) {
+  
+  df.dist=data.frame(dist=dists[i], 
+                     p_2.5=quantile(p[i,], cred.int[1]), 
+                     p_97.5=quantile(p[i,], cred.int[2]), 
+                     p_median=quantile(p[i,], 0.5))
+  
+  col.prob.dist=rbind(col.prob.dist, 
+                      df.dist)
+}
+
+
+col.prob.dist=col.prob.dist[-1,]
+
+```
+
+
+```{r ker.plot print, fig.height=3, fig.width=4}
+
+ker.plot=ggplot(col.prob.dist[col.prob.dist$dist<=50000,])+
+  geom_line(aes(dist, p_median))+
+  geom_ribbon(aes(x = dist, ymin=p_2.5, ymax=p_97.5), alpha=0.3)+
+  theme_bw()+xlab('Distance (m)')+ylab('Probability')#+
+  #ggtitle(TeX("$P = 1-e^{-\\lambda^2d^{-2\\lambda}e^{\\gamma}}$"))+
+  #ggtitle(TeX("$P = 1-e^{-\\frac{e^\\gamma}{d^2}$"))
+
+print(ker.plot)
+```
+
+El área en gris denota el intervalo de credibilidad del `r cred.int.level` %.
+
+```{r p_0.1.dist}
+
+p.decay=0.1
+
+gam = mean(sam.w$gamma)
+
+d = sqrt( -1*exp(gam) / log(1-p.decay) )
+
+```
+
+La probabilidad media de colonización decae por debajo de `r p.decay` a partir de `r d` metros de distancia.
+
+## Extrapolación del modelo de suitabilidad a Sudamérica
+
+Con los valores medios de las posteriores de los parámetros asociados a variables climáticas se estimó la suitabilidad actualizada a lo largo de todo el continente sudamericano.
+
+```{r post-prior suitability geographic projection}
+
+post.suit.latam=mean(sam.w$b0)+
+  mean(sam.w$PC1.b1)*pc.latam.latam$map$PC_1+
+  mean(sam.w$PC1.b2)*pc.latam.latam$map$PC_1^2+
+  mean(sam.w$PC2.b1)*pc.latam.latam$map$PC_2+
+  mean(sam.w$PC2.b2)*pc.latam.latam$map$PC_2^2+
+  mean(sam.w$PC3.b1)*pc.latam.latam$map$PC_3+
+  mean(sam.w$PC3.b2)*pc.latam.latam$map$PC_3^2
+
+post.suit.latam=invlogit(post.suit.latam)
+
+prior.suit.latam=predict(pc.latam.latam$map, prior.niche)%>%invlogit()
+
+latam.suit=list(Prior=prior.suit.latam, Posterior=post.suit.latam)%>%
+  stack()
+
+ext.crop.suit=extent(latam.suit$Prior)
+ext.crop.suit[4]=ext.crop.suit[4]*0.75
+
+latam.suit=crop(latam.suit, extent(latam.suit$Prior)*c(1, 0.75, 1, 1))
+
+prior.suit.gg=ggplot(mapping = aes(y=lat, x=lon))+
+  geom_raster(data=latam.suit$Prior, alpha=0.9,
+              aes(x=x, y=y, fill=Prior))+
+  theme_void()+
+  scale_fill_viridis(option = 'viridis', na.value = "white")+ 
+  coord_equal()+
+  labs(fill='Suitability')+
+  labs(fill='Aptitud
+ambiental')+
+  ggtitle('Prior')+
+  theme(legend.position = 'bottom', plot.margin = unit(c(0, -0.3, 0, 0), 'cm'))+
+  annotation_scale()
+
+post.suit.gg=ggplot(mapping = aes(y=lat, x=lon))+
+  geom_raster(data=latam.suit$Posterior, alpha=0.9,
+              aes(x=x, y=y, fill=Posterior), show.legend = T)+
+  theme_void()+
+  scale_fill_viridis(option = 'viridis', na.value = "white")+ 
+  coord_equal()+
+  labs(fill='')+
+  ggtitle('Posterior')+
+  theme(legend.position = 'bottom', plot.margin = unit(c(0, 0, 0, -0.3), 'cm'))+
+  labs(fill='Aptitud
+ambiental'
+)
+
+gg.suit=ggarrange(plotlist=list(prior.suit.gg, post.suit.gg)
+                  #,widths = c(5, 7)+2.5
+                  )
+print(gg.suit)
+
+
+ggsave(filename = 'plots/rasters.plots/gg.suit.png', plot=gg.suit,
+       height = 14, width = 15, units = 'cm', dpi = 1200, device = 'png', bg = 'white')
+
+
+```
+
+
+# *Para hacer de acá en adelante*
+
+Mi idea es usar este modelo de dispersión que estimé para hacer las simualciones del objetivo 2 de la tesina (además de que la estimación del kernel de dispersión *B. terrestris* ya me parece algo interesante de por sí). Para esto voy a partir de estados iniciales sencillos sembrando colonias en el centro de chile y con esas series temporales simuladas hacer comparaciones con el estado actual. Probablemente la comparación la haga entre las medias (y/o alguna otra métrica) de PC_1, 2 y 3 del conjunto de celdas colonizadas en la simulación al tiempo $t$ y el conjunto de celdas con registros reales de BT. Esto me permitiría responder a la pregunta del obj2 de si se espera que la evolución del patrón de ocupación de nicho de BT siga evolucionando o si ya está ocupandolo todo. Por otra parte me va a paermitir hacer predicciones en el espacio geográfico, *i.e* predecir el curso de la invasión a futuro. El último gráfico usa solo la media de las posteriores para hacer esa proyección, pero mi idea es en todos los casos hacer las simulaciones con una muestra de la posterior para tener intervalos de certiducmbre para las predicciones de invasibilidad.
+
+
+
+# Análisis prospectivo de la invasión de B. terrestris
+
+
+```{r simulation extent}
+
+sim.extent=c(-1.5e6, 1.6e6, -6.5e6, -2.8e06)%>%extent()
+
+```
+
+
+```{r Latinoamerica map preparation}
+
+# ver tema del mapa esta roto por ahora
+paises=c("argentina", "bolivia", "brazil",
+         "chile", "colombia", "ecuador",
+         "guyana", "paraguay", "peru",
+         "suriname", "uruguay", "venezuela")
+
+latam.map=ne_countries(country = paises, scale = 'medium')
+crs(latam.map)=lonlat.crs
+
+latam.map=spTransform(latam.map, latam.proj)%>%
+  crop(y=sim.extent)
+
+
+
+latam.states=ne_states(country = paises)
+crs(latam.states)=lonlat.crs
+
+latam.states=spTransform(latam.states, latam.proj)%>%
+  crop(y=sim.extent)
+
+
+# update
+sim.extent=extent(latam.map)
+
+```
+
+
+
+
+## Simulaciones desde 1997 ppcheck
+
+
+```{r Simulation parameters ppcheck}
+
+# El condiiconal ppcheck.base no es importante
+# es algo sucio que arme para evitar correr las simulaciones a cada render
+
+ppcheck.base=!run.pp.check.sims
+
+if (ppcheck.base) {
+  n.years=30
+  
+  n.sims=100
+  
+  sim.cell.size=50000
+  
+  
+  from.1997=T
+  
+  posterior.sample=T
+  
+  if (posterior.sample) {
+    post.type.message='una muestra aleatoria'
+  }else{
+    post.type.message='los valores medios'
+  }
+  
+  run.simulations=F
+  
+}else{
+  n.years=30
+  
+  n.sims=100
+  
+  sim.cell.size=50000
+  
+  
+  from.1997=T
+  
+  posterior.sample=T
+  
+  if (posterior.sample) {
+    post.type.message='una muestra aleatoria'
+  }else{
+    post.type.message='los valores medios'
+  }
+  run.simulations=T
+}
+
+
+
+
+
+```
+
+Con `r post.type.message` de las posteriores de todos los parámetros se realizaron `r n.sims` simulaciones de dispersión de *B. terrestris* a partir de un conjunto de celdas colonizadas por la introducción comercial de colonias en un conjunto de coordenadas **cita montalva**. Las simulaciones se realizaron en series de `r n.years` años partiendo de 1997, con celdas de un tamaño de ~`r sim.cell.size/1000` $km$. 
+
+Año a año se calculó, para cada celda, la probabilidad de ser colonizada dado un conjunto de celdas colonizadas en años anteriores y unas condiciones ambientales determinadas en dicha celda. Con este valor de probabilidad se determinó la colonización o no mediante un proceso de Bernoulli.
+Para proyectar las coordenadas de las celdas a un espacio euclideo y calcular las distancias con el menor error posible se realizó una proyección UTM (`r latam.proj`).
+
+```{r Simulations preparation ppcheck}
+
+# list of simulations matrices
+sim.list=list()
+
+# template from climatic latam data
+sim.raster.0=pc.latam.latam$map$PC_1%>%crop(sim.extent)
+sim.raster.0[!is.na(sim.raster.0[])]=0
+
+## new raster with choosed cell.sizes
+
+# number of horizontal and vertical cells given cell size and raster extent
+x.n.cells.sim = abs( sim.extent[1]-sim.extent[2] ) / sim.cell.size
+y.n.cells.sim = abs( sim.extent[3]-sim.extent[4] ) / sim.cell.size
+
+# build raster
+sim.raster.seed=raster(ext=sim.extent, 
+                  nrows=y.n.cells.sim, 
+                  ncols=x.n.cells.sim, 
+                  crs=crs(sim.raster.0)) #
+
+# transfer values from template to new raster
+sim.raster.seed[]=raster::extract(sim.raster.0, coordinates(sim.raster.seed))
+
+# reproject current BT ocurrences to UTM 21 (latam proj)
+
+
+if (from.1997) {
+  start.dist=as.matrix(int.df[,1:2])%>%
+    SpatialPoints()%>%
+    `projection<-`(lonlat.crs)%>%
+    spTransform(latam.proj)
+  
+  start.dist=as.matrix(mp[mp$year==1997,1:2])%>%
+    SpatialPoints()%>%
+    `projection<-`(nproj)%>%
+    spTransform(latam.proj)
+    
+}else{
+  start.dist=as.matrix(mp[,1:2])%>%
+    SpatialPoints()%>%
+    `projection<-`(nproj)%>%
+    spTransform(latam.proj)
+}
+
+
+# current ocurrences rasterization
+col.seed=rasterize(x=start.dist, 
+             y=sim.raster.seed)
+col.seed[col.seed>=1]=1
+col.seed[is.na(col.seed)]=0
+
+## mount current occurrences on seed raster space
+sim.raster.seed=sim.raster.seed+col.seed
+
+# define continent filter
+continent.filter=!is.na(sim.raster.seed[])
+
+all.cells.index=1:length(sim.raster.seed[])
+continent.index=all.cells.index[continent.filter]
+
+# distances matrix
+sim.coor=coordinates(sim.raster.seed)
+
+d=dist(sim.coor[continent.filter,])%>%
+  as.matrix()
+
+# fil simulation matrix with seed data (to preserve NAs)
+sim.mat=matrix(rep(sim.raster.seed[continent.filter], n.years), 
+               byrow=T, nrow=n.years)
+
+sim.mat.ls=list()
+
+suit.list=list()
+
+
+# env variables
+sim.env.ls=list()
+
+for (i in 1:nlayers(pc.latam.latam$map)) {
+  sim.env.ls[[i]]=sim.raster.seed
+  
+  sim.env.ls[[i]][]=raster::extract(pc.latam.latam$map[[i]], 
+                                 coordinates(sim.raster.seed))
+  #sim.env.ls[[i]][]=vals
+}
+
+sim.env=stack(sim.env.ls)
+names(sim.env)=names(pc.latam.latam$map)
+
+
+
+
+
+```
+
+```{r Simulations ppcheck, message=FALSE}
+
+sim.mat.ls.filename.past=paste0('./intermediate_files/past_sim.mat.ls_y.', 
+                                n.years, '_n.', n.sims, '_s.', 
+                                sim.cell.size/1000, '.kms.RDS')
+
+if (run.simulations) {
+  for (k in 1:n.sims) {
+  message(paste('sim', k))
+  
+  if (posterior.sample) {
+    
+    # sample one point in MCMC
+    k.chain=sample(1:n.chains, 1)
+    k.iter=sample( (burnin+1):Niter, 1)
+    
+    # assembly parameters list
+    pars.df=sam.w
+    rownames(pars.df)=NULL
+    
+    sim.pars.vec=pars.df[pars.df$chain==k.chain&
+                       pars.df$iter==k.iter,
+                       3:10]%>%as.numeric()
+    
+  }else{ # eman posterior values
+    sim.pars.vec=as.matrix(pars.df[,3:10])%>%colMeans()
+  }
+  
+  
+  sim.pars.k=relist(sim.pars.vec, pars)
+  
+  ## compute suitability raster layer 
+  
+  suit.terms=pars$cov.pars
+  
+  
+  # computes each linear term except intercept
+  for (i in (1:length(cov.names))+1 ) {
+    
+    for (j in 1:length(terms)) {
+      
+      # suit contribution of i PC and j term
+      suit.ij = (sim.env[[i-1]])^j * as.numeric(sim.pars.k$cov.pars[[i]][[j]])
+      
+      suit.terms[[i]][[j]]=suit.ij
+      
+    }
+  }
+  # add intercept
+  suit.terms$b0=sim.pars.k$cov.pars$b0%>%as.numeric()
+  
+  suit.terms.un=unlist(suit.terms)
+  
+  # integrate terms
+  suit.terms.sum=suit.terms.un[2:7]%>%stack()%>%sum()
+  suit.k=suit.terms.sum+suit.terms$b0
+  suit.k=invlogit(suit.k)
+  
+  suit.list[[k]]=suit.k
+  
+  sim.mat.k=sim.mat
+  
+  for (i in 2:n.years) {
+    message(paste('year', i))
+    
+    colonized = (1:ncol(sim.mat.k))[sim.mat.k[i-1,]==1]
+    uncolonized = (1:ncol(sim.mat.k))[sim.mat.k[i-1,]==0]
+    
+    
+    for (j in 1:ncol(sim.mat.k)) {
+      if ( !is.na(sim.mat.k[i-1,j]) ) {
+        
+        if (is.na(sim.mat.k[i,j])) {
+          #print(sim.mat[i,j])
+        }
+        
+        
+        if (sim.mat.k[i-1,j]==0) {
+          
+          # calculates amount of years since donor cells were colonized
+          T_j=matrix(sim.mat.k[ 1:i-1 , sim.mat.k[i-1,]==1 ], nrow=i-1)%>%
+            colSums(na.rm = F)
+          
+          col.times=matrix(sim.mat.k[ 1:i-1 , ], nrow=i-1)%>%
+            colSums(na.rm = F)
+          
+          T_j2=col.times[colonized]
+          
+          # flux from each cell to focal cell given gamma and distances
+          flux_j= exp(sim.pars.k$gamma) / (d[j, colonized]^2)
+          
+          # integration across donor cells
+          flux.time_j=flux_j*T_j
+          phi_j= sum(flux.time_j) * suit.k[continent.index[j]]
+          
+          # debug
+          if (is.na(phi_j)) {
+            #print(c(k, i, j))
+          }
+          
+          # colonization probability
+          p0=exp(-1*phi_j)
+          p1=1-p0
+          sim.mat[i,j]=rbinom(1, 1, p1)
+        
+        }else{
+        sim.mat.k[i,j]=1
+        }
+      }
+    }
+  }
+  
+  # store k simaulation amtrix in list
+  sim.mat.ls[[k]]=sim.mat.k
+  }
+  
+  saveRDS(object = sim.mat.ls, file=sim.mat.ls.filename.past)
+}
+
+
+
+#saveRDS(object = sim.mat.ls, file='intermediate_files/sim.mat.ls.2000.RDS')
+
+```
+
+
+```{r Sim. rasterization ppcheck, message=FALSE, warning=FALSE}
+#save.image()
+
+
+
+sim.mat.ls=readRDS(file=sim.mat.ls.filename.past)
+
+# empty list to fill with each temporal series of rasters (in a RasterStack fmt)
+raster.sim.ls=list()
+
+for (i in 1:n.sims) {
+  
+  # empty list to fill with each year colonization state of i simluation
+  raster.sim.i=list()
+  
+  for (j in 1:n.years) {
+    
+    # template
+    ras=sim.raster.seed
+    
+    # fill with values of simulation i at year j
+    ras[continent.index]=sim.mat.ls[[i]][j, ]
+    
+    raster.sim.i[[j]]=ras
+  }
+  
+  names(raster.sim.i)=paste('Year', 1:n.years)
+  
+  # stack and sotre
+  raster.sim.ls[[i]]=stack(raster.sim.i)
+  
+}
+
+names(raster.sim.ls)=paste('Sim.', 1:n.sims)
+
+
+#plot(raster.sim.ls$`Sim. 1`)
+
+```
+
+
+```{r Sim. year summary ppcheck}
+
+current_year=1996
+
+col.y.mat=matrix(NA, ncol=ncol(sim.mat.ls[[1]]), 
+                 nrow = n.sims)
+
+for (i in 1:n.sims) {
+  
+  mat.i=sim.mat.ls[[i]]
+  
+  ys=1:n.years
+  
+  col.ys=c()
+    
+  for (j in 1:ncol(mat.i)) {
+    
+    
+    # si fue colonizada
+    if ( sum(mat.i[,j])>=1 ) {
+      #print('col')
+      
+      # todos los anios con celda colonizada
+      col.ys.vec.j = ys[ mat.i[, j]==1 ]
+      # primer anio de detección en la simulacion
+      col.year.min.j=min(col.ys.vec.j)
+      #print(col.year.min.j)
+    }else{ # si no
+      #print('nocol')
+      col.year.min.j=NA
+    }
+    
+    col.ys[j]=col.year.min.j
+    
+  }
+  col.y.mat[i, ]=col.ys
+}
+
+col.y.mat=col.y.mat+current_year
+
+
+col.year.summary=data.frame(mean=1:ncol(col.y.mat), 
+                            min=NA, 
+                            max=NA, 
+                            median=NA, 
+                            q_2.5=NA, 
+                            q_97.5=NA)
+
+for (i in 1:nrow(col.year.summary)) {
+  
+  col.year.summary$mean[i]=mean( col.y.mat[,i], na.rm = T)%>%suppressWarnings()
+  col.year.summary$min[i]=min( col.y.mat[,i], na.rm = T)%>%suppressWarnings()
+  col.year.summary$max[i]=max( col.y.mat[,i], na.rm = T)%>%suppressWarnings()
+  col.year.summary$median[i]=median( col.y.mat[,i], na.rm = T)%>%suppressWarnings()
+  col.year.summary$q_2.5[i]=quantile( col.y.mat[,i], 0.025, na.rm = T)%>%suppressWarnings()
+  col.year.summary$q_97.5[i]=quantile( col.y.mat[,i], 0.975, na.rm = T)%>%suppressWarnings()
+  
+}
+
+
+col.summary.raster=list()
+
+for (k in 1:ncol(col.year.summary)) {
+  # template
+  summ.ras=sim.raster.seed
+  summ.ras[continent.index]=col.year.summary[,k]
+  #print(class(summ.ras))
+  
+  col.summary.raster[[k]]=summ.ras
+}
+
+col.summary.raster=stack(col.summary.raster)
+names(col.summary.raster)=colnames(col.year.summary)
+
+# transformation to dataframe
+col.summary.raster.df=fortify(col.summary.raster)
+
+col.summary.raster.df=reshape::melt.data.frame(col.summary.raster.df, 
+                         id.vars=1:2)
+
+col.summary.raster.df$value=round(col.summary.raster.df$value)
+
+decades=seq(1995, 2030, 5)
+col.summary.raster.df$dec=cut(col.summary.raster.df$value, 
+    decades, 
+    labels=paste0('<', decades[-1]))
+
+col.summary.raster.df$value=as.ordered(col.summary.raster.df$value)
+
+
+```
+
+
+Para cada celda con ocurrencias de *Bombus terrestris* se evaluaron los años de colonización registrados en las simulaciones para evaluar el grado de fidelidad del modelo con los datos.
+
+```{r posterior check, results='hold', fig.height=3.5, fig.width=8}
+
+ll.proj=spTransform(ll, CRS(latam.proj))
+
+ll.proj.df=as.data.frame(ll.proj)
+  
+
+bt=cbind(ll.proj.df, year=oc[,3])
+
+col.hist=bt[,c('lon', 'lat', 'year')]
+
+#cell.size=sim.cell.size # meters
+#x.n.cells=round(abs(max(col.hist$lon)-min(col.hist$lon))/cell.size)
+#y.n.cells=round(abs(max(col.hist$lat)-min(col.hist$lat))/cell.size)
+
+
+#r=raster(ncol=x.n.cells, nrow=y.n.cells, ext=extent(ll.proj))
+#r[]=1:length(r)
+
+rp=rasterize(x=as.matrix(col.hist[,1:2]), 
+             y=col.summary.raster$mean)
+
+rp[rp[]>=1]=1
+
+# rasterizacion por anio
+s=list()
+for (i in 1:length(levels(y))) {
+  #print(i)
+  mp.i=col.hist[col.hist$year<=as.integer(levels(y)[i]),]
+  
+  rp.i=rasterize(x=as.matrix(mp.i[,1:2]), 
+                 y=col.summary.raster$mean)
+  rp.i[rp.i[]>=1]=1
+  
+  s[[i]]=rp.i
+}
+s=stack(s)
+names(s)=levels(y)%>%as.character()
+
+
+# p/c/celda se queda con el 1er anio con registros
+C=c()
+#yl=1:nlayers(s)
+yl=levels(y)%>%as.character()%>%as.integer()
+
+for (i in 1:length(rp)) {
+  #print(i)
+  c.i=s[[1:nlayers(s)]][i]
+  if (all(is.na(c.i))) {
+    C[i]=NA
+  }else{
+    C[i]=yl[!is.na(c.i)]%>%min()
+  }
+}
+
+rp.y=rp
+rp.y[]=C
+
+## data visualization Figure A ####
+
+points=coordinates(rp.y)%>%as.data.frame()
+points$Year=rp.y[]
+points$Year=as.factor(points$Year)
+points=points[points$y<=extent(pc.latam.patag)[4],]
+
+
+#current.points=points[,1:2]%>%
+  #SpatialPoints()%>%
+  #`projection<-`(nproj)%>%
+  #spTransform(latam.proj)%>%
+  #as.data.frame()
+
+current.points=points
+
+current.points$year=as.character(points$Year)%>%as.numeric()
+
+inv.years.current=raster::extract(col.summary.raster, current.points[,1:2])%>%
+  as.data.frame()
+inv.years.current$obs.year=current.points$year%>%as.character()%>%as.numeric()
+
+
+sim.year.ppc=pivot_longer(inv.years.current, cols = colnames(inv.years.current)[1:6])
+
+colnames(sim.year.ppc)=c('obs.year', 'sim.summary', 'sim.year')
+
+pp.plot=ggplot(sim.year.ppc[!sim.year.ppc$sim.summary%in%c('max', 'min', 'mean'
+                                                   ),], 
+       aes(obs.year, sim.year))+
+  geom_point(aes(obs.year, sim.year, col=sim.summary)
+             , show.legend = F
+             ,size=2, alpha=0.3
+             )+
+  facet_grid(.~sim.summary)+
+  geom_abline(slope = 1, intercept = 0, col='black')+
+  #geom_smooth(method = 'lm', col=sim.summary, formula = sim.year~obs.year+sim.summary)+
+  theme_bw()+
+  xlab('Año del primer registro')+
+  ylab('Año de colonización en las simulaciones')+
+  xlim(1996, 1996+n.years)+ylim(1996, 1996+n.years)
+
+print(pp.plot)
+
+```
+
+```{r posterior check no faceting, fig.height=4, fig.width=8, results='hold'}
+sim.year.ppc$col=ifelse(sim.year.ppc$sim.summary=='median', 'black', 'grey')
+
+p.data=sim.year.ppc[!sim.year.ppc$sim.summary%in%c('max', 'min', 'mean'
+),]
+
+p.data$sim.summary[p.data$sim.summary=='median']='mediana'
+p.data$sim.summary[p.data$sim.summary=='q_2.5']=' 2.5 %'
+p.data$sim.summary[p.data$sim.summary=='q_97.5']=' 97.5 %'
+
+# correlation
+median=sim.year.ppc[sim.year.ppc$sim.summary=='median',]
+r.sq=cor(median$obs.year, median$sim.year, use='pairwise.complete.obs')
+
+# regression
+ppc.lm=lm(median, formula = sim.year ~ obs.year)
+slope=coefficients(ppc.lm)[2]
+
+
+#ppc.blm=brms::brm(data=median, formula = sim.year ~ obs.year)
+
+
+ppcheck.plot=ggplot(p.data, 
+aes(obs.year, sim.year))+
+  geom_point(aes(pch=sim.summary, col=sim.summary)
+             #, col=sim.summary
+             
+             , show.legend = T
+             ,size=1.5, alpha=0.8
+  )+
+  #facet_grid(.~'sim.summary')+
+  geom_abline(slope = 1, intercept = 0, col='black', linetype='dashed')+
+  geom_smooth(data=median, 
+              method = 'lm', aes(obs.year, sim.year), 
+              level=0.99, fullrange=T, col='violetred', fill='violetred', alpha=0.1)+
+  theme_bw()+
+  xlab('Año del primer registro')+
+  ylab('Año de colonización en las simulaciones')+
+  xlim(1996, 2022)+ylim(1996, 1996+n.years)+
+  stat_regline_equation(data=median, label.y = 2022, col='violetred',
+                        aes(obs.year, sim.year, label = ..eq.label..)) +
+  stat_regline_equation(data=median, label.y = 2020, col='violetred',
+                        aes(obs.year, sim.year, label = ..rr.label..))+
+  scale_colour_manual(name = "Percentil",values = c('grey80', 'grey80', 'green4'))+
+  scale_shape_manual(name = "Percentil",values = 17:15)
+
+print(ppcheck.plot)
+
+ggsave(plot=ppcheck.plot, filename = 'plots/svg/ppcheck.plot.svg', 
+       height = 10, width = 17, units = 'cm', 
+       device = 'svg')
+
+ggsave(plot=ppcheck.plot, filename = '../../../Tesina.Lican/figuras tesina/raster/Figura 10.png', 
+       height = 9, width = 17, units = 'cm', 
+       device = 'png', dpi=300)
+
+
+```
+
+
+
+Este gráfico muestra el año de colonización registrado en las simulaciones (media y percentiles 2.5 y 97.5) contra el año en que se registró la colonización en los datos reales.
+
+
+```{r Sim. plots ppcheck, fig.height=6, fig.width=5, eval=T, include=F, echo=F}
+
+
+col.maps=ggplot(col.summary.raster.df[!col.summary.raster.df$variable%in%
+                                        c('mean', 'min', 'max', 'q_2.5', 'q_97.5'
+                                          ),])+
+  geom_raster(aes(x, y, fill=value))+ 
+  #scale_fill_brewer(palette = "OrRd")+
+  #scale_fill_continuous(guide = guide_colourbar(direction = "horizontal",nbin = 30))+
+  facet_grid(.~variable)+
+  #scale_fill_viridis()+
+  #theme(legend.position = 'bottom')+
+  scale_fill_viridis_d('Year', 
+                       direction = -1, 
+                       option = 'volcano')+
+  geom_polygon(data=latam.map, 
+               aes(long, lat, group=group),
+               alpha=0, col='black')+ # Mapa
+  theme_classic()+ # estilo del gráfico (que no haya grilla por ej.)
+  coord_equal()+ # que no deforme horizontal ni verticalmente las ecalas
+  xlab('Longitude in km')+
+  ylab('Latitude in km')+
+  #xlim(c(-2500000, 3300000))+
+  #scale_x_continuous(labels=function(x)x/1000, n.breaks = 5)+
+  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  #ylim(c(-6500000, 1500000))+
+  #scale_y_continuous(labels=function(x)x/1000, n.breaks = 5)+
+  ggtitle('Year of colonization')+
+  annotation_scale()+
+  geom_point(data=points[points$Year==1997&!is.na(points$Year),], 
+             mapping = aes(x, y), col='red', size=2, alpha=0.7)
+
+print(col.maps)
+
+```
+
+
+## simulaciones a futuro desde 2021
+
+```{r Simulation parameters future}
+
+
+
+# El condiiconal future.base no es importante
+# es algo sucio que arme para evitar correr las simulaciones a cada render
+
+future.base=!run.future.BT.sims
+
+if (future.base) {
+  n.years=20
+  
+  n.sims=300
+  
+  sim.cell.size=25000
+  
+  from.1997=F
+
+  run.simulations=F
+}else{
+  
+  n.years=20
+  
+  n.sims=300
+  
+  sim.cell.size=25000
+  
+  from.1997=F
+
+  run.simulations=T
+}
+
+
+
+
+```
+
+Con `r post.type.message` de las posteriores de todos los parámetros se realizaron `r n.sims` simulaciones de dispersión de *B. terrestris* a partir de un conjunto de celdas colonizadas registradas hasta 2021. Las simulaciones se realizaron en series de `r n.years` años partiendo de 2021, con celdas de un tamaño de ~`r sim.cell.size/1000` $km$.
+
+
+```{r Simulations preparation future}
+
+
+
+# list of simulations matrices
+sim.list=list()
+
+# template from climatic latam data
+sim.raster.0=pc.latam.latam$map$PC_1%>%crop(sim.extent)
+sim.raster.0[!is.na(sim.raster.0[])]=0
+
+## new raster with choosed cell.sizes
+
+# number of horizontal and vertical cells given cell size and raster extent
+x.n.cells.sim = abs( sim.extent[1]-sim.extent[2] ) / sim.cell.size
+y.n.cells.sim = abs( sim.extent[3]-sim.extent[4] ) / sim.cell.size
+
+# build raster
+sim.raster.seed=raster(ext=sim.extent, 
+                  nrows=y.n.cells.sim, 
+                  ncols=x.n.cells.sim, 
+                  crs=crs(sim.raster.0)) #
+
+# transfer values from template to new raster
+sim.raster.seed[]=raster::extract(sim.raster.0, coordinates(sim.raster.seed))
+
+# reproject current BT ocurrences to UTM 21 (latam proj)
+
+
+if (from.1997) {
+  start.dist=as.matrix(int.df[,1:2])%>%
+    SpatialPoints()%>%
+    `projection<-`(lonlat.crs)%>%
+    spTransform(latam.proj)
+    
+}else{
+  start.dist=as.matrix(mp[,1:2])%>%
+    SpatialPoints()%>%
+    `projection<-`(nproj)%>%
+    spTransform(latam.proj)
+}
+
+sim.env.ls=list()
+
+for (i in 1:nlayers(pc.latam.latam$map)) {
+  sim.env.ls[[i]]=sim.raster.seed
+  
+  sim.env.ls[[i]][]=raster::extract(pc.latam.latam$map[[i]], 
+                                 coordinates(sim.raster.seed))
+  #sim.env.ls[[i]][]=vals
+}
+
+sim.env=stack(sim.env.ls)
+names(sim.env)=names(pc.latam.latam$map)
+
+
+# current ocurrences rasterization
+col.seed=rasterize(x=start.dist, 
+             y=sim.raster.seed)
+col.seed[col.seed>=1]=1
+col.seed[is.na(col.seed)]=0
+
+## mount current occurrences on seed raster space
+sim.raster.seed=sim.raster.seed+col.seed
+
+# define continent filter
+continent.filter=!is.na(sim.raster.seed[])
+
+all.cells.index=1:length(sim.raster.seed[])
+continent.index=all.cells.index[continent.filter]
+
+# distances matrix
+sim.coor=coordinates(sim.raster.seed)
+
+d=dist(sim.coor[continent.filter,])%>%
+  as.matrix()
+
+# fil simulation matrix with seed data (to preserve NAs)
+sim.mat=matrix(rep(sim.raster.seed[continent.filter], n.years), 
+               byrow=T, nrow=n.years)
+
+sim.mat.ls=list()
+
+suit.list=list()
+
+
+
+```
+
+```{r Simulations future, message=FALSE}
+
+sim.mat.ls.filename.future=paste0('./intermediate_files/future_sim.mat.ls_y.', 
+                           n.years, '_n.', n.sims, '_s.', sim.cell.size/1000, '.kms.RDS')
+
+if (run.simulations) {
+    for (k in 1:n.sims) {
+    message(paste('sim', k))
+    
+    if (posterior.sample) {
+        
+      # sample one point in MCMC
+      k.chain=sample(1:n.chains, 1)
+      k.iter=sample( (burnin+1):Niter, 1)
+      
+      # assembly parameters list
+      pars.df=sam.w
+      rownames(pars.df)=NULL
+      
+      sim.pars.vec=pars.df[pars.df$chain==k.chain&
+                         pars.df$iter==k.iter,
+                         3:10]%>%as.numeric()
+      
+    }else{ # eman posterior values
+      sim.pars.vec=as.matrix(pars.df[,3:10])%>%colMeans()
+    }
+    
+    
+    sim.pars.k=relist(sim.pars.vec, pars)
+    
+    ## compute suitability raster layer 
+    
+    suit.terms=pars$cov.pars
+    
+    
+    # computes each linear term except intercept
+    for (i in (1:length(cov.names))+1 ) {
+      
+      for (j in 1:length(terms)) {
+        
+        # suit contribution of i PC and j term
+        suit.ij = (sim.env[[i-1]])^j * as.numeric(sim.pars.k$cov.pars[[i]][[j]])
+        
+        suit.terms[[i]][[j]]=suit.ij
+        
+      }
+    }
+    # add intercept
+    suit.terms$b0=sim.pars.k$cov.pars$b0%>%as.numeric()
+    
+    suit.terms.un=unlist(suit.terms)
+    
+    # integrate terms
+    suit.terms.sum=suit.terms.un[2:7]%>%stack()%>%sum()
+    suit.k=suit.terms.sum+suit.terms$b0
+    suit.k=invlogit(suit.k)
+    
+    suit.list[[k]]=suit.k
+    
+    sim.mat.k=sim.mat
+    
+    for (i in 2:n.years) {
+      message(paste('year', i))
+      
+      colonized = (1:ncol(sim.mat.k))[sim.mat.k[i-1,]==1]
+      uncolonized = (1:ncol(sim.mat.k))[sim.mat.k[i-1,]==0]
+      
+      
+      for (j in 1:ncol(sim.mat.k)) {
+        if ( !is.na(sim.mat.k[i-1,j]) ) {
+          
+          if (is.na(sim.mat.k[i,j])) {
+            #print(sim.mat[i,j])
+          }
+          
+          
+          if (sim.mat.k[i-1,j]==0) {
+            
+            # calculates amount of years since donor cells were colonized
+            T_j=matrix(sim.mat.k[ 1:i-1 , sim.mat.k[i-1,]==1 ], nrow=i-1)%>%
+              colSums(na.rm = F)
+            
+            col.times=matrix(sim.mat.k[ 1:i-1 , ], nrow=i-1)%>%
+              colSums(na.rm = F)
+            T_j2=col.times[colonized]
+            
+            # flux from each cell to focal cell given gamma and distances
+            flux_j= exp(sim.pars.k$gamma) / (d[j, colonized]^2)
+            
+            # integrationa across donor cells
+            flux.time_j=flux_j*T_j
+            phi_j= sum(flux.time_j) * suit.k[continent.index[j]]
+            
+            # debug
+            if (is.na(phi_j)) {
+              #print(c(k, i, j))
+            }
+            
+            # colonization probability
+            p0=exp(-1*phi_j)
+            p1=1-p0
+            sim.mat[i,j]=rbinom(1, 1, p1)
+          
+          }else{
+          sim.mat.k[i,j]=1
+          }
+        }
+      }
+    }
+    
+    # store k simaulation amtrix in list
+    sim.mat.ls[[k]]=sim.mat.k
+  }
+
+#save.image()
+
+  saveRDS(object = sim.mat.ls, file=sim.mat.ls.filename.future)
+}
+
+#saveRDS(object = sim.mat.ls, file='intermediate_files/sim.mat.ls.2000.RDS')
+
+```
+
+
+```{r Sim. rasterization future}
+#save.image()
+
+
+
+sim.mat.ls=readRDS(file=sim.mat.ls.filename.future)
+
+# empty list to fill with each temporal series of rasters (in a RasterStack fmt)
+raster.sim.ls=list()
+
+for (i in 1:n.sims) {
+  
+  # empty list to fill with each year colonization state of i simluation
+  raster.sim.i=list()
+  
+  for (j in 1:n.years) {
+    
+    # template
+    ras=sim.raster.seed
+    
+    # fill with values of simulation i at year j
+    ras[continent.index]=sim.mat.ls[[i]][j, ]
+    
+    raster.sim.i[[j]]=ras
+  }
+  
+  names(raster.sim.i)=paste('Year', 1:n.years)
+  
+  # stack and sotre
+  raster.sim.ls[[i]]=stack(raster.sim.i)
+  
+}
+
+names(raster.sim.ls)=paste('Sim.', 1:n.sims)
+
+
+#plot(raster.sim.ls$`Sim. 1`)
+
+```
+
+
+```{r Sim. year summary future}
+
+current_year=max(oc$year, na.rm = T)-1
+
+col.y.mat=matrix(NA, ncol=ncol(sim.mat.ls[[1]]), 
+                 nrow = n.sims)
+
+for (i in 1:n.sims) {
+  
+  mat.i=sim.mat.ls[[i]]
+  
+  ys=1:n.years
+  
+  col.ys=c()
+    
+  for (j in 1:ncol(mat.i)) {
+    
+    
+    # si fue colonizada
+    if ( sum(mat.i[,j])>=1 ) {
+      #print('col')
+      
+      # todos los anios con celda colonizada
+      col.ys.vec.j = ys[ mat.i[, j]==1 ]
+      # primer anio de detección en la simulacion
+      col.year.min.j=min(col.ys.vec.j)
+      #print(col.year.min.j)
+    }else{ # si no
+      #print('nocol')
+      col.year.min.j=Inf
+    }
+    
+    col.ys[j]=col.year.min.j
+    
+  }
+  col.y.mat[i, ]=col.ys
+}
+
+col.y.mat=col.y.mat+current_year
+
+
+col.year.summary=data.frame(mean=1:ncol(col.y.mat), 
+                            min=NA, 
+                            max=NA, 
+                            median=NA, 
+                            q_2.5=NA, 
+                            q_97.5=NA)
+
+for (i in 1:nrow(col.year.summary)) {
+  
+  col.year.summary$mean[i]=mean( col.y.mat[,i], na.rm = T)%>%suppressWarnings()
+  col.year.summary$min[i]=min( col.y.mat[,i], na.rm = T)%>%suppressWarnings()
+  col.year.summary$max[i]=max( col.y.mat[,i], na.rm = T)%>%suppressWarnings()
+  col.year.summary$median[i]=median( col.y.mat[,i], na.rm = T)%>%suppressWarnings()
+  col.year.summary$q_2.5[i]=quantile( col.y.mat[,i], 0.025, na.rm = T)%>%suppressWarnings()
+  col.year.summary$q_97.5[i]=quantile( col.y.mat[,i], 0.975, na.rm = T)%>%suppressWarnings()
+  
+}
+
+
+col.summary.raster=list()
+
+for (k in 1:ncol(col.year.summary)) {
+  # template
+  summ.ras=sim.raster.seed
+  summ.ras[continent.index]=col.year.summary[,k]
+  #print(class(summ.ras))
+  
+  col.summary.raster[[k]]=summ.ras
+}
+
+col.summary.raster=stack(col.summary.raster)
+names(col.summary.raster)=colnames(col.year.summary)
+
+# transformation to dataframe
+col.summary.raster.df=fortify(col.summary.raster)
+
+col.summary.raster.df=reshape::melt.data.frame(col.summary.raster.df, 
+                         id.vars=1:2)
+
+col.summary.raster.df$value=round(col.summary.raster.df$value)
+
+decades=seq(2020, 2100, 2)
+col.summary.raster.df$dec=cut(col.summary.raster.df$value, 
+    decades, 
+    labels=paste0('<', decades[-1]))
+
+col.summary.raster.df$value=as.ordered(col.summary.raster.df$value)
+
+
+```
+
+
+```{r Sim. plots future, fig.height=5, fig.width=10, results='hold'}
+
+
+#col.summary.raster.df[col.summary.raster.df==Inf]=NA
+
+
+formatter1000 <- function(){
+  function(x)x/1000
+}
+
+col.summary.raster.df$variable=as.character(col.summary.raster.df$variable)
+
+col.summary.raster.df$variable[col.summary.raster.df$variable=='median']='Mediana'
+col.summary.raster.df$variable[col.summary.raster.df$variable=='q_2.5']='2.5 %'
+col.summary.raster.df$variable[col.summary.raster.df$variable=='q_97.5']='97.5 %'
+
+col.summary.raster.df$variable=as.factor(col.summary.raster.df$variable)
+
+col.summary.raster.df$variable=relevel(col.summary.raster.df$variable, 'Mediana')
+
+col.summary.raster.df$variable=relevel(col.summary.raster.df$variable, '2.5 %')
+
+col.maps=ggplot(col.summary.raster.df[!col.summary.raster.df$variable%in%
+                                        c('mean', 
+                                          'min', 'max'),])+
+  geom_raster(aes(x, y, fill=dec))+ 
+  #scale_fill_brewer(palette = "OrRd")+
+  #scale_fill_continuous(guide = guide_colourbar(direction = "horizontal", nbin = 30))+
+  facet_grid(.~variable)+
+  #scale_fill_viridis()+
+  #theme(legend.position = 'bottom')+
+  #scale_fill_viridis_d('Año de 
+#colonización', direction = -1,option = 'B', na.value = 'white')+ 
+  scale_fill_brewer(palette = 'Spectral', na.value = 'white')+
+  geom_polygon(data=latam.states, 
+               aes(long, lat, group=group),
+               alpha=0, col='grey35', lwd=0.2)+
+  geom_polygon(data=latam.map, 
+               aes(long, lat, group=group),
+               alpha=0, col='black', lwd=0.4)+ # Mapa
+  theme_classic()+ # estilo del gráfico (que no haya grilla por ej.)
+  coord_equal()+ # que no deforme horizontal ni verticalmente las ecalas
+  xlab('Longitud (en km)')+
+  ylab('Latitud (en km)')+
+  labs(fill='Año de 
+colonización ')+
+  #xlim(c(-2500000, 3300000))+
+  #scale_x_continuous(labels=function(x)x/1000, n.breaks = 5)+
+  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  #ylim(c(-6500000, sim.extent[4]))+
+  #scale_y_continuous(labels=function(x)x/1000, n.breaks = 5)+
+  #ggtitle('Year of colonization')+
+  #annotation_scale()+
+  theme(axis.text.x = element_text(angle = 90), 
+        legend.position = 'top',
+        legend.spacing.x = unit(0, 'cm'), 
+        legend.text = element_text(angle = 45, vjust=0.5, hjust = 0.8), 
+        legend.direction = 'horizontal', 
+        legend.title = element_text(hjust=0.5, vjust=0.1))+
+  guides(fill = guide_legend(label.position = "top", 
+                             nrow=1))+
+  scale_y_continuous(labels=formatter1000())+
+  scale_x_continuous(labels=formatter1000())
+
+#col.maps=col.maps+geom_point(data = current.points[!is.na(current.points$year),1:2],aes(x, y), size=0.8, alpha=0.7, col='red')
+
+print(col.maps)
+
+
+ggsave(plot=col.maps, filename = 'plots/svg/future.sims.map.svg', 
+       height = 15, width = 20, units = 'cm', 
+       device = 'svg')
+
+ggsave(plot=col.maps, filename = 'plots/rasters.plots/future.sims.map.png', 
+       height = 15, width = 20, units = 'cm', 
+       device = 'png', dpi=1200)
+
+```
+
+
+
+### Evaluación a nivel de nicho climático (en pausa por ahora)
+
+```{r occurrences-cells climatic data pre-processing, eval=T, include=T}
+
+# current observed colonized cells
+current.patag.coor=coordinates(sim.raster.seed)[continent.filter&
+                                                  sim.raster.seed[]==1,]%>%
+  as.data.frame()
+
+current.patag.coor$year=current_year
+
+current.patag.coor[, names(sim.env)]=raster::extract(sim.env, 
+                                                 current.patag.coor[,1:2])
+
+current.patag.coor$region='Patagonia'
+
+#plot(sim.env$PC_1)
+#points(current.patag.coor[,1:2])
+
+# cells colonized in simulations
+## colonized indexs
+col.index=continent.index[!is.na(col.year.summary$median)]
+
+sim.patag.coor=coordinates(col.summary.raster$mean)[col.index, ]%>%
+  as.data.frame()
+
+sim.patag.coor$year=round(col.year.summary$median[col.index])
+
+# merging
+real.sim.patag=rbind(current.patag.coor[,1:3], sim.patag.coor)
+
+# adding enviromental variables
+real.sim.patag[, names(sim.env)]=raster::extract(sim.env, 
+                                                 real.sim.patag[,1:2])
+
+
+
+
+#real.sim.patag$dec=as.ordered(real.sim.patag$dec)
+
+#real.sim.patag=real.sim.patag[!is.na(real.sim.patag$dec),]
+
+
+# europe cells
+
+eu.env=eu.oc.pc[eu.oc.pc$type==1, names(sim.env)]
+
+eu.env$region='Europa'
+
+n.oc.eu=1000
+
+eu.env=eu.env[sample(1:nrow(eu.env), size = n.oc.eu),]
+
+
+# latam sims cells
+
+decades=seq(2015, 2100, 5)
+
+real.sim.patag$dec=cut(real.sim.patag$year, decades, labels=paste0('<', decades[-1]))
+real.sim.patag$region='America'
+
+
+oc.bind=rbind(eu.env, current.patag.coor[,-c(1:3)])
+
+
+
+```
+
+
+```{r enviromental background, eval=T, include=T}
+
+# extract cell valeus from europe raster pcs
+pc.eu.vals.na=pc.eu.from.latam[[1:3]][]%>%as.data.frame()
+
+
+# coordenadas para despues recuperar los valores discretizados de PCs y mapearlos
+eu.coor.na=coordinates(pc.eu.from.latam)%>%as.data.frame()
+
+# filter NAs
+pc.eu.vals=pc.eu.from.latam[[1:3]][!is.na(pc.eu.vals.na$PC_1[])]%>%as.data.frame()
+
+pc.eu.vals=cbind(pc.eu.vals, eu.coor.na[!is.na(pc.eu.from.latam$PC_1[]),])
+
+
+
+
+n.eu.sample=5000
+
+eu.sam.index=sample(x= 1 :nrow(pc.eu.vals), size = n.eu.sample)
+
+pc.eu.vals.sam=pc.eu.vals[eu.sam.index,]
+
+pc.eu.vals.sam$region='Europa'
+
+
+
+# values patag
+
+pc.patag.vals.na=pc.latam.patag[[1:3]][]%>%as.data.frame()
+
+# coordenadas para despues recuperar los valores discretizados de PCs y mapearlos
+patag.coor.na=coordinates(pc.latam.patag)%>%as.data.frame()
+
+# filter NAs
+pc.patag.vals=pc.latam.patag[[1:3]][!is.na(pc.patag.vals.na$PC_1[])]%>%as.data.frame()
+
+pc.patag.vals=cbind(pc.patag.vals, patag.coor.na[!is.na(pc.patag.vals.na$PC_1[]),])
+
+n.patag.sample=n.eu.sample
+
+patag.sam.index=sample(x= 1 :nrow(pc.patag.vals), size = n.patag.sample)
+
+pc.patag.vals.sam=pc.patag.vals[patag.sam.index,]
+
+
+pc.patag.vals.sam$region='Patagonia'
+
+
+
+
+
+# values latam
+
+pc.latam.vals.na=pc.latam.latam$map[[1:3]][]%>%as.data.frame()
+
+# filter NAs
+pc.latam.vals=pc.latam.latam$map[[1:3]][!is.na(pc.latam.vals.na$PC_1[])]%>%as.data.frame()
+
+n.latam.sample=n.eu.sample
+
+latam.sam.index=sample(x= 1 :nrow(pc.latam.vals), size = n.latam.sample)
+
+pc.latam.vals.sam=pc.latam.vals[latam.sam.index,]
+
+
+pc.latam.vals.sam$region='America'
+
+
+
+
+
+bgs.df=rbind(pc.eu.vals.sam, pc.patag.vals.sam#, pc.latam.vals.sam
+             )
+
+#bgs.df$region=relevel(bgs.df$region, ref = 'Europe')
+
+
+
+```
+
+```{r 2d kernels integration, eval=T, include=T}
+
+df.bg.ls=list(eu=pc.eu.vals.sam, pat=pc.patag.vals.sam, lat=pc.latam.vals.sam)
+
+
+# specify desired contour levels:
+prob <- c(seq(0.1, 0.9, 0.1))
+
+## PCs 1 y 2
+
+df.bg.ker.ls.12=list()
+
+for (i in 1:length(df.bg.ls)) {
+  
+  # robado de Stack Overflow
+  kd.est <- kde2d(df.bg.ls[[i]][,'PC_1'], df.bg.ls[[i]][,'PC_2'],
+                  n = 400, lims = c(-12, 10, -10, 10))
+  
+  dx <- diff(kd.est$x[1:2])  # lifted from emdbook::HPDregionplot()
+  dy <- diff(kd.est$y[1:2])
+  sz <- sort(kd.est$z)
+  c1 <- cumsum(sz) * dx * dy
+  
+ 
+  
+  # plot:
+  dimnames(kd.est$z) <- list(kd.est$x, kd.est$y)
+  dc <- melt(kd.est$z)
+  dc$prob <- approx(sz, 1-c1, dc$value)$y
+  
+  df.bg.ker.ls.12[[i]]=dc
+}
+
+names(df.bg.ker.ls.12)=names(df.bg.ls)
+
+df.bg.ker.ls.12$eu$region='Europa'
+df.bg.ker.ls.12$pat$region='Patagonia'
+df.bg.ker.ls.12$lat$region='America'
+
+df.bg.ker.12=do.call('rbind', df.bg.ker.ls.12)
+
+
+
+## PCs 1 y 3
+
+df.bg.ker.ls.13=list()
+
+for (i in 1:length(df.bg.ls)) {
+  
+  # robado de Stack Overflow
+  kd.est <- kde2d(df.bg.ls[[i]][,'PC_1'], df.bg.ls[[i]][,'PC_3'], 
+                  n = 400, lims = c(-12, 10, -10, 10))
+  
+  dx <- diff(kd.est$x[1:2])  # lifted from emdbook::HPDregionplot()
+  dy <- diff(kd.est$y[1:2])
+  sz <- sort(kd.est$z)
+  c1 <- cumsum(sz) * dx * dy
+  
+ 
+  
+  # plot:
+  dimnames(kd.est$z) <- list(kd.est$x, kd.est$y)
+  dc <- melt(kd.est$z)
+  dc$prob <- approx(sz, 1-c1, dc$value)$y
+  
+  df.bg.ker.ls.13[[i]]=dc
+}
+
+names(df.bg.ker.ls.13)=names(df.bg.ls)
+
+df.bg.ker.ls.13$eu$region='Europa'
+df.bg.ker.ls.13$pat$region='Patagonia'
+df.bg.ker.ls.13$lat$region='America'
+
+df.bg.ker.13=do.call('rbind', df.bg.ker.ls.13)
+
+
+
+## PCs 2 y 3
+
+df.bg.ker.ls.23=list()
+
+for (i in 1:length(df.bg.ls)) {
+  
+  # robado de Stack Overflow
+  kd.est <- kde2d(df.bg.ls[[i]][,'PC_2'], df.bg.ls[[i]][,'PC_3'], 
+                  n = 400, lims = c(-12, 10, -10, 10))
+  
+  dx <- diff(kd.est$x[1:2])  # lifted from emdbook::HPDregionplot()
+  dy <- diff(kd.est$y[1:2])
+  sz <- sort(kd.est$z)
+  c1 <- cumsum(sz) * dx * dy
+  
+ 
+  
+  # plot:
+  dimnames(kd.est$z) <- list(kd.est$x, kd.est$y)
+  dc <- melt(kd.est$z)
+  dc$prob <- approx(sz, 1-c1, dc$value)$y
+  
+  df.bg.ker.ls.23[[i]]=dc
+}
+
+names(df.bg.ker.ls.23)=names(df.bg.ls)
+
+df.bg.ker.ls.23$eu$region='Europa'
+df.bg.ker.ls.23$pat$region='Patagonia'
+df.bg.ker.ls.23$lat$region='America'
+
+df.bg.ker.23=do.call('rbind', df.bg.ker.ls.23)
+
+
+```
+
+
+
+```{r env to vbiotope scheme, eval=F, include=F}
+# Esquema de lo que quiero hacer (grafico para la diapo)
+
+ggplot(bgs.df[bgs.df$region!='America',], aes(PC_1, PC_2))+
+  geom_contour(data=df.bg.ker.12[df.bg.ker.12$region!='America'&df.bg.ker.12$region!='Europe',], 
+               aes(X1, X2, z=prob, fill=prob), 
+               breaks = 1-c(seq(0.1, 1, 0.1)), col='black',
+               linetype=11)+
+  geom_contour(data=df.bg.ker.12[df.bg.ker.12$region!='America'&df.bg.ker.12$region!='Europe',], 
+               aes(X1, X2, z=prob), show.legend = F,  col='black',
+               breaks = 1-c(0.1, 0.5), lwd=1.2)+
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_classic()+
+  #facet_grid(.~region)+
+  geom_point(data=oc.bind[oc.bind$region=='Patagonia',],
+             col='orangered', alpha=0.8, size=1.9)+
+  #xlim(-11, -1)+ylim(-9, 3.5)+
+  theme(legend.position = 'top')+
+  #guides(col=guide_legend(title="Región"))+
+  xlab('PC 1')+ylab('PC 2')
+
+
+```
+
+
+3 perpectivas ortogonales de patrones espaciales
+
+
+```{r plot env pcs 1 2 y 3, fig.height=6, fig.width=6, eval=T, include=T, results='hold'}
+
+#df.bg.ker.12_2=df.bg.ker.12
+#df.bg.ker.12_2$region=df.bg.ker.12_2$region
+#df.bg.ker.12_2=df.bg.ker.12_2[,names(df.bg.ker.12_2)!='region']
+
+#df.bg.ker.12$region=factor(df.bg.ker.12$region, levels = c('Europe', 'America', 'Patagonia'))
+
+
+p12=ggplot(bgs.df[bgs.df$region!='America',], aes(PC_1, PC_2))+
+  geom_contour(data=df.bg.ker.12[df.bg.ker.12$region!='America',], 
+               aes(X1, X2, z=prob, col=region), show.legend = T, 
+               breaks = 1-c(seq(0.1, 1, 0.1)), 
+               linetype=11, alpha=0.8)+
+  geom_contour(data=df.bg.ker.12[df.bg.ker.12$region!='America',], 
+               aes(X1, X2, z=prob, col=region), show.legend = T, 
+               breaks = 1-c(0.1, 0.5), lwd=1.2, alpha=1)+
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_bw()+
+  #geom_point(data=oc.bind, col='black', alpha=1, size=1.5)+
+  geom_point(data=oc.bind,
+             aes(fill=region), show.legend = T
+             , alpha=0.6, size=1.5, shape=21)+
+  #xlim(-11, 6)+#ylim(-9, 3.5)+
+  theme(legend.position = 'top', 
+        legend.text = element_text(size=14))+
+  #guides(col=guide_legend(title="Región"))+
+  xlab(paste0('PC 1 (', vars.cum[1], '%)'))+
+  ylab(paste0('PC 2 (', vars.cum[2], '%)'))+
+  scale_colour_manual(name=' ', values = c('darkorchid1', 'goldenrod1'))+
+  scale_fill_manual(name=' ', values = c('chartreuse2', 'firebrick1'))
+
+
+
+#df.bg.ker.13_2=df.bg.ker.13
+#df.bg.ker.13_2$Region=df.bg.ker.13_2$region
+#df.bg.ker.13_2=df.bg.ker.13_2[,names(df.bg.ker.13_2)!='region']
+
+
+p13=ggplot(bgs.df[bgs.df$region!='America',], aes(PC_1, PC_3))+
+  geom_contour(data=df.bg.ker.13[df.bg.ker.13$region!='America',], 
+               aes(X1, X2, z=prob, col=region), show.legend = F, 
+               breaks = 1-c(seq(0.1, 1, 0.1)), 
+               linetype=11, alpha=0.8)+
+  geom_contour(data=df.bg.ker.13[df.bg.ker.13$region!='America',], 
+               aes(X1, X2, z=prob, col=region), show.legend = T, 
+               breaks = 1-c(0.1, 0.5), lwd=1.2, alpha=1)+
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_bw()+
+  #geom_point(data=oc.bind, col='black', alpha=1, size=1.5)+
+  geom_point(data=oc.bind,
+             aes(fill=region), show.legend = T
+             , alpha=0.6, size=1.5, shape=21)+
+  #xlim(-11, 6)+#ylim(-9, 3.5)+
+  theme(legend.position = 'none')+
+  #guides(col=guide_legend(title="Región"))+
+  xlab(paste0('PC 1 (', vars.cum[1], '%)'))+
+  ylab(paste0('PC 3 (', vars.cum[3], '%)'))+
+  scale_colour_manual(name=' ', values = c('darkorchid1', 'goldenrod1'))+
+  scale_fill_manual(name=' ', values = c('chartreuse2', 'firebrick1'))
+
+
+
+
+#df.bg.ker.23_2=df.bg.ker.23
+#df.bg.ker.23_2$Region=df.bg.ker.13_2$region
+#df.bg.ker.23_2=df.bg.ker.23_2[,names(df.bg.ker.23_2)!='region']
+
+
+p23=ggplot(bgs.df[bgs.df$region!='America',], aes(PC_2, PC_3))+
+  geom_contour(data=df.bg.ker.23[df.bg.ker.23$region!='America',], 
+               aes(X1, X2, z=prob, col=region), show.legend = F, 
+               breaks = 1-c(seq(0.1, 1, 0.1)), 
+               linetype=11, alpha=0.8)+
+  geom_contour(data=df.bg.ker.23[df.bg.ker.23$region!='America',], 
+               aes(X1, X2, z=prob, col=region), show.legend = T, 
+               breaks = 1-c(0.1, 0.5), lwd=1.2, alpha=1)+
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_bw()+
+  #geom_point(data=oc.bind, col='black', alpha=1, size=1.5)+
+  geom_point(data=oc.bind,
+             aes(fill=region), show.legend = T
+             , alpha=0.6, size=1.5, shape=21)+
+  #xlim(-11, 6)+#ylim(-9, 3.5)+
+  theme(legend.position = 'none')+
+  #guides(col=guide_legend(title="Región"))+
+  xlab(paste0('PC 2 (', vars.cum[2], '%)'))+
+  ylab(paste0('PC 3 (', vars.cum[3], '%)'))+
+  scale_colour_manual(name=' ', values = c('darkorchid1', 'goldenrod1'))+
+  scale_fill_manual(name=' ', values = c('chartreuse2', 'firebrick1'))
+
+
+#ggarrange(plotlist = list(p12, p13, p23), ncol=1)
+
+
+bg.oc.plot=grid_arrange_shared_legend(p12, p13, p23, position='top')
+
+
+ggsave(filename = 'plots/rasters.plots/bg.oc.plot.png', plot=bg.oc.plot,width = 26, height = 12, units = 'cm', dpi=800, device = 'png', bg='white')
+
+```
+
+
+
+
+
+```{r 3d }
+
+# 3D plots
+library(rgl)
+
+# scatter3d(oc.bind$PC_1, oc.bind$PC_2, oc.bind$PC_3, groups = as.factor(oc.bind$region), surface = F)
+
+bgs.df2=bgs.df[bgs.df$region!='America',]
+
+
+
+bgs.df2$color=NA
+bgs.df2$color[bgs.df2$region=='Europa']='darkorchid1'
+bgs.df2$color[bgs.df2$region=='Patagonia']='goldenrod1'
+
+
+#attach(bgs.df2)
+
+xlims = c(min(bgs.df2$PC_1)-.5, max(bgs.df2$PC_1)+.5)
+zlims = c(min(bgs.df2$PC_2)-.5, max(bgs.df2$PC_2)+.5)
+ylims = c(min(bgs.df2$PC_3)-.5, max(bgs.df2$PC_3)+.5)
+
+# Static chart
+plot3d( bgs.df2$PC_1, bgs.df2$PC_3, bgs.df2$PC_2, col = bgs.df2$color, type = "s", radius = .07 , alpha=0.2, 
+        xlim = xlims, 
+        ylim = ylims, 
+        zlim = zlims)
+
+rgl.snapshot('./plots/3d.bg.png', fmt='png')
+
+rgl.postscript('./plots/3d.bg_vectorial.svg', fmt='svg')
+
+# We can indicate the axis and the rotation velocity
+# play3d( spin3d( axis = c(1, 1, 1), rpm = 6), duration = 10 )
+
+# Save like gif
+
+movie=F
+
+
+if (movie) {
+  movie3d(
+  movie="3dAnimatedScatterplot", 
+  spin3d( axis = c(1, 1, 1), rpm = 6),
+  duration = 10, 
+  dir = "./plots/gif 3d/",
+  type = "gif", 
+  clean = TRUE, fps=25
+)
+}
+
+
+
+#detach(bgs.df2)
+
+
+
+oc.bind$color=NA
+oc.bind$color[oc.bind$region=='Europa']='chartreuse2'
+oc.bind$color[oc.bind$region=='Patagonia']='firebrick1'
+
+
+
+#attach(oc.bind)
+
+plot3d( oc.bind$PC_1, oc.bind$PC_3, oc.bind$PC_2, col = oc.bind$color, 
+        type = "s", radius = .07 , alpha=1, 
+        xlim = xlims, 
+        ylim = ylims, 
+        zlim = zlims)
+
+#rgl.snapshot('./plots/3d.oc.png', fmt='png')
+
+
+
+
+
+
+#detach(oc.bind)
+```
+
+
+```{r 3 plot 2da version}
+
+bgs.df2$alpha=0.2
+bgs.df2$size=0.1
+
+oc.bind$alpha=0.8
+oc.bind$size=0.15
+
+
+rgl.clear()
+
+bt.df.3d=rbind(oc.bind[,c('PC_1', 'PC_2', 'PC_3', 'color', 'alpha', 'size')], 
+               bgs.df2[,c('PC_1', 'PC_2', 'PC_3', 'color', 'alpha', 'size')])
+
+bt.df.3d$color=as.factor(bt.df.3d$color)
+levels(bt.df.3d$color)
+
+
+attach(bt.df.3d)
+
+
+plot3d( PC_1, PC_3, PC_2, col = bt.df.3d$color, 
+        type = "s", radius = bt.df.3d$size , alpha=bt.df.3d$alpha, 
+        xlim = xlims, 
+        ylim = ylims, 
+        zlim = zlims)
+detach(bt.df.3d)
+
+
+#rgl.snapshot('./plots/3dplots/3d.bg.oc_3.png', fmt='png')
+
+#rgl.postscript('./plots/3dplots/3d.bg.oc_2.pdf', fmt='pdf')
+#rgl.postscript('./plots/3dplots/3d.bg.oc_2.svg', fmt='svg')
+
+
+movie=F
+
+if (movie) {
+  movie3d(
+  movie="3dAnimatedScatterplot", 
+  spin3d( axis = c(0, 1, 1), rpm = 6),
+  duration = 10, 
+  dir = "./plots/gif2/",
+  type = "gif", 
+  clean = TRUE, fps=25
+)
+}
+
+```
+
+
+
+
+```{r, results='hold', fig.height=3, fig.width=7, eval=F, include=F}
+
+
+library(gg3D)
+
+phi=c(90, 0, 0)+0
+theta=c(0, 130, 0)
+
+col=c('darkred', 'darkgreen', 'darkblue')
+
+labs=c('PC_1', 'PC_2', 'PC_3')
+
+g0=ggplot(bgs.df2, aes(x=PC_1, y=PC_2, z=PC_3, color=region))+
+  axes_3D(theta=theta[1], phi=phi[1], col='black') +
+  stat_3D(theta=theta[1], phi=phi[1], alpha=1, size=2)+
+  labs(col='Region')
+
+g1=ggplot(bgs.df2, aes(x=PC_1, y=PC_2, z=PC_3, color=region))+
+  axes_3D(theta=theta[1], phi=phi[1], col='black') +
+  stat_3D(theta=theta[1], phi=phi[1], alpha=0.2, size=0.5)+
+  labs_3D(theta=theta[1], phi=phi[1],
+    labs=labs
+    ,hjust=c(1,-0.2,-0.2), vjust=c(-1, 1, 0), angle=0, col=col
+    )+
+  ggtitle('  A')
+
+g2=ggplot(bgs.df2, aes(x=PC_1, y=PC_2, z=PC_3, color=region))+
+  axes_3D(theta=theta[2], phi=phi[2], col='black') +
+  stat_3D(theta=theta[2], phi=phi[2], alpha=0.2, size=0.5)+
+  labs_3D(theta=theta[2], phi=phi[2],
+    labs=labs
+    ,hjust=c(-0.6,1,1.4), vjust=c(0.7, -1.5, 1), angle=0, col=col
+    )+
+  ggtitle('  B')
+
+g3=ggplot(bgs.df2, aes(x=PC_1, y=PC_2, z=PC_3, color=region))+
+  axes_3D(theta=theta[3], phi=phi[3], col='black') +
+  stat_3D(theta=theta[3], phi=phi[3], alpha=0.2, size=0.5)+
+  labs_3D(theta=theta[3], phi=phi[3],
+    labs=labs
+    ,hjust=c(1,0,-0.2), vjust=c(-1, 1, 1), angle=0, col=col
+    )+
+  ggtitle('  C')
+
+
+
+oc.bind=oc.bind[complete.cases(oc.bind),]
+
+g4=ggplot(oc.bind, aes(x=PC_1, y=PC_2, z=PC_3, color=region))+
+  axes_3D(theta=theta[1], phi=phi[1], col='black') +
+  stat_3D(theta=theta[1], phi=phi[1], alpha=0.3, size=1.5)+
+  labs_3D(theta=theta[1], phi=phi[1],
+    labs=labs
+    ,hjust=c(1,-0.2,-0.2), vjust=c(-1, 1, 0), angle=0, col=col
+    )+
+  ggtitle('  D')
+
+
+g5=ggplot(oc.bind, aes(x=PC_1, y=PC_2, z=PC_3, color=region))+
+  axes_3D(theta=theta[2], phi=phi[2], col='black') +
+  stat_3D(theta=theta[2], phi=phi[2], alpha=0.3, size=1.5)+
+  labs_3D(theta=theta[2], phi=phi[2],
+    labs=labs
+    ,hjust=c(-0.6,1,1.4), vjust=c(0.7, -1.5, 1), angle=0, col=col
+    )+
+  ggtitle('  E')
+
+g6=ggplot(oc.bind, aes(x=PC_1, y=PC_2, z=PC_3, color=region))+
+  axes_3D(theta=theta[3], phi=phi[3], col='black') +
+  stat_3D(theta=theta[3], phi=phi[3], alpha=0.3, size=1.5)+
+  labs_3D(theta=theta[3], phi=phi[3],
+    labs=labs
+    ,hjust=c(1,0,-0.2), vjust=c(-1, 1, 1), angle=0, col=col
+    )+
+  ggtitle('  F')
+
+leg = get_legend(g0)
+no_leg=theme(legend.position = "none")
+
+plot_grid(
+  g1+theme_void()+no_leg+theme(plot.title = element_text(hjust = 0)), 
+  g2+theme_void()+no_leg+theme(plot.title = element_text(hjust = 0)), 
+  g3+theme_void()+no_leg+theme(plot.title = element_text(hjust = 0)), 
+  leg, 
+  g4+theme_void()+no_leg+theme(plot.title = element_text(hjust = 0)), 
+  g5+theme_void()+no_leg+theme(plot.title = element_text(hjust = 0)), 
+  g6+theme_void()+no_leg+theme(plot.title = element_text(hjust = 0)), 
+  ncol=4, rel_widths = c(1, 1.4, 1))
+
+```
+
+
+```{r, results='hold', eval=F, include=F}
+
+phi=c(90, 0, 0)+0
+theta=c(0, 130, 0)
+
+#col=c('red', 'green', 'blue')
+
+labs=c('PC_1', 'PC_2', 'PC_3')
+
+#oc.bind$region=as.factor(oc.bind$region)
+
+
+```
+
+
+```{r, eval=F, include=F}
+library(plotly)
+
+plot_ly(x=bgs.df2$PC_1, y=bgs.df2$PC_2, z=bgs.df2$PC_3, 
+        alpha_stroke  = 0.4,
+        type="scatter3d", mode="markers", color=bgs.df2$region)
+
+
+```
+
+
+
+```{r future in env viz, results='hold', eval=F, include=F}
+
+# esto ignorarlo por ahora
+
+real.sim.patag.sam=real.sim.patag[sample(1:nrow(real.sim.patag), size = 1000),]
+
+
+df.bg.ker.12$region=factor(as.character(df.bg.ker.12$region), 
+                           levels = c('Europe', 'Patagonia', 'America'))
+
+
+
+p12=ggplot(bgs.df[bgs.df$region!='Patagonia',], aes(PC_1, PC_2))+
+  geom_contour(data=df.bg.ker.12[,], 
+               aes(X1, X2, z=prob, col=region), show.legend = F, 
+               breaks = 1-c(seq(0.1, 1, 0.1)), 
+               linetype=11)+
+  geom_contour(data=df.bg.ker.12[df.bg.ker.12$region!='Patagonia'&df.bg.ker.12$region!='Europe',], 
+               aes(X1, X2, z=prob, col=region), show.legend = F, 
+               breaks = 1-c(0.1, 0.5), lwd=1.2)+
+  #guides(col=guide_legend(title="Región"))+
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_bw()+
+  ggnewscale::new_scale_color()+
+  #facet_grid(.~dec)+
+  #geom_point(data=real.sim.patag[!is.na(real.sim.patag$dec),], col='black', alpha=0.8, size=1.5)+
+  geom_point(data=real.sim.patag.sam,
+             aes(fill=dec), show.legend = F
+             , alpha=0.9, size=1.5, shape=21)+
+  scale_fill_viridis_d('Year', 
+                       direction =-1)+
+  #xlim(-11, -1)+ylim(-9, 3.5)+
+  theme(legend.position = NULL)+
+  guides(fill=guide_legend(title="Colonización"))+
+  xlab('PC 1')+ylab('PC 2')
+
+
+df.bg.ker.13$region=factor(df.bg.ker.13$region, 
+                           levels = c('Europe', 'Patagonia', 'America'))
+
+p13=ggplot(bgs.df[bgs.df$region!='Patagonia',], aes(PC_1, PC_3))+
+  geom_contour(data=df.bg.ker.13[,], 
+               aes(X1, X2, z=prob, col=region), show.legend = F, 
+               breaks = 1-c(seq(0.1, 1, 0.1)), 
+               linetype=11)+
+  geom_contour(data=df.bg.ker.13[df.bg.ker.13$region!='Patagonia'&df.bg.ker.13$region!='Europe',], 
+               aes(X1, X2, z=prob, col=region), show.legend = T, 
+               breaks = 1-c(0.1, 0.5), lwd=1.2)+
+  #guides(col=guide_legend(title="Región"))+
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_bw()+
+  ggnewscale::new_scale_color()+
+  #facet_grid(.~dec)+
+  #geom_point(data=real.sim.patag[!is.na(real.sim.patag$dec),], col='black', alpha=0.8, size=1.5)+
+  geom_point(data=real.sim.patag.sam,
+             aes(fill=dec), show.legend = T
+             , alpha=0.9, size=1.5, shape=21)+
+  scale_fill_viridis_d('Year', 
+                       direction =-1)+
+  #xlim(-11, -1)+ylim(-9, 3.5)+
+  theme(legend.position = NULL)+
+  guides(fill=guide_legend(title="Colonización"))+
+  xlab('PC 1')+ylab('PC 3')
+
+
+ggarrange(plotlist = list(p12, p13), ncol=2, widths = c(1, 1.3))
+
+
+
+
+```
+
+```{r, eval=F, include=F}
+
+# esto ignorarlo por ahora
+
+
+df.bg.ker.13$id='i13'
+df.bg.ker.12$id='i12'
+
+df.bg.ker=rbind(df.bg.ker.13, df.bg.ker.12)
+
+
+ggplot(bgs.df[bgs.df$region!='Patagonia',], aes(PC_1, PC_2))+
+  geom_contour(data=df.bg.ker[,], 
+               aes(X1, X2, z=prob, col=region), show.legend = F, 
+               breaks = 1-c(seq(0.1, 1, 0.1)), 
+               linetype=11)+
+  geom_contour(data=df.bg.ker[df.bg.ker$region!='Patagonia'&df.bg.ker$region!='Europe',], 
+               aes(X1, X2, z=prob, col=region), show.legend = F, 
+               breaks = 1-c(0.1, 0.5), lwd=1.2)+
+  #guides(col=guide_legend(title="Región"))+
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_bw()+
+  ggnewscale::new_scale_color()+
+  facet_grid(.~id)+
+  #geom_point(data=real.sim.patag[!is.na(real.sim.patag$dec),], col='black', alpha=0.8, size=1.5)+
+  geom_point(data=real.sim.patag.sam,
+             aes(fill=dec), show.legend = F
+             , alpha=0.9, size=1.5, shape=21)+
+  scale_fill_viridis_d('Year', 
+                       direction =-1)+
+  #xlim(-11, -1)+ylim(-9, 3.5)+
+  theme(legend.position = NULL)+
+  guides(fill=guide_legend(title="Colonización"))+
+  xlab('PC 1')+ylab('PC 2')
+
+
+```
+
+
+
+
+
+
+
+
+Esquemas para la diapo
+
+```{r maps.pc.patag, eval=F, include=F}
+pc_map_list=list()
+for (i in 1:2) {
+  pc_map_list[[i]]=ggplot()+
+    geom_raster(data=pc.latam.patag[[i]],
+                aes_string(x='x', y='y', fill=paste0('PC_', i)))+
+    theme_void()+
+    scale_fill_viridis(option = 'viridis', na.value = "white")+ 
+    coord_equal()+
+    ggtitle(paste0('PC ', i))+
+    theme(legend.position = 'bottom', 
+          plot.title = element_text(hjust=0.5))+
+    labs(fill=NULL)+
+    geom_point(data=bt, aes(lon, lat),
+             col='black', alpha=1, size=1.4)+
+    geom_point(data=bt, aes(lon, lat),
+             col='orangered', alpha=1, size=1)
+}
+
+
+
+gg.pc.maps=ggarrange(plotlist=pc_map_list, ncol = 2)
+
+print(gg.pc.maps)
+```
+
+
+
+```{r, eval=F, include=F}
+
+# IGNORAR 
+
+p.pat.bg=ggplot(bgs.df[,], aes(PC_1, PC_3))+
+  geom_density_2d(#col='black', 
+                  aes(col=region), contour_var = "ndensity", bins=30)+ 
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_bw()+
+  #facet_grid(.~region)+
+  geom_point(data=oc.bind[oc.bind$region!='America'&oc.bind$region!='Patagonia',],
+             col='black', alpha=0.5, size=1.8)+
+  geom_point(data=oc.bind[oc.bind$region!='America'&oc.bind$region!='Patagonia',],
+             aes(col=region)
+             , alpha=0.5, size=1)+
+  xlim(-11, 3)+ylim(-5, 5)+
+  theme(legend.position = 'top')
+
+p.pat.all=ggplot(bgs.df, aes(PC_1, PC_3))+
+  geom_density_2d(#col='black', 
+                  aes(col=region), contour_var = "ndensity", bins=50)+ 
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_bw()+
+  #facet_grid(.~region)+
+  geom_point(data=oc.bind[oc.bind$region!='America'&oc.bind$region!='Europe',],
+             col='black', alpha=0.5, size=1.8)+
+  geom_point(data=oc.bind[oc.bind$region!='America'&oc.bind$region!='Europe',],
+             aes(col=region)
+             , alpha=0.5, size=1)+
+  xlim(-11, 3)+ylim(-5, 5)+
+  theme(legend.position = 'top')
+
+pl=list(p.pat.bg, p.pat.all)
+
+ggarrange(plotlist = pl, ncol=length(pl))
+```
+
+
+
+```{r, eval=F, include=F}
+# IGNORAR
+
+ggplot(bgs.df[bgs.df$region!='America',]
+       , aes(PC_1, PC_2))+
+  geom_point(alpha=0.1, size=0.1)+
+  geom_density_2d(#col='black', 
+                  aes(col=region), contour_var = "ndensity"
+                  #,linemitre=5
+                  )+ 
+  #geom_density_2d_filled(alpha = 0.4, contour_var = "ndensity")+
+  #geom_point(size=0.1, alpha=0.4)+
+  theme_bw()+
+  facet_grid(.~region)+
+  #geom_point(data=oc.bind, alpha=0.5, size=1.5)+
+  xlim(-11, 6)+ylim(-10, 5)#+coord_equal()
+```
+
+
+### re mapeo from env to geo
+
+
+```{r, eval=F, include=F}
+
+# genero un df que tenga los valores ambientales de cada set de puntos
+# para los sets de los backgrounds agrego las coordenadas espaciales además
+
+pc.pat.bg.grid=pc.patag.vals
+pc.pat.bg.grid$region='pat.bg'
+
+pc.pat.oc.grid=oc.bind[oc.bind$region=='Patagonia',1:3]
+pc.pat.oc.grid$x=NA
+pc.pat.oc.grid$y=NA
+pc.pat.oc.grid$region='pat.oc'
+
+
+
+
+pc.eu.bg.grid=pc.eu.vals
+pc.eu.bg.grid$region='eur.bg'
+
+pc.eu.oc.grid=oc.bind[oc.bind$region=='Europe',1:3]
+pc.eu.oc.grid$x=NA
+pc.eu.oc.grid$y=NA
+pc.eu.oc.grid$region='eur.oc'
+
+
+pc.grid.points=rbind(pc.pat.bg.grid, pc.pat.oc.grid, pc.eu.bg.grid, pc.eu.oc.grid)
+
+# creo que está obsoleta
+#library(arules) # discretize function
+
+
+pc.grid.discr=pc.grid.points
+
+
+n.cuts=30
+
+cuts.m=matrix(NA, ncol=3, nrow=n.cuts)
+
+for (i in 1:3) {
+  #pc.grid.discr[,i]=discretize(pc.grid.points[,i], 
+  #                             ordered_result = T, method = 'interval', breaks = 20)
+  
+  cuts=c(seq(min(pc.grid.discr[,i], na.rm = T), max(pc.grid.discr[,i], na.rm = T),
+             length=n.cuts))
+  
+  cuts.m[,i]=cuts
+  
+  cuts.i=c(-Inf, 
+         cuts, 
+          Inf)
+  
+  
+  
+  
+  pc.grid.discr[,i]=cut(pc.grid.points[,i], 
+                               ordered_result = T, breaks = cuts.i)
+  
+  
+}
+
+pc.grid.discr=pc.grid.discr[complete.cases(pc.grid.discr[,1:3]),]
+
+pc.grid.discr$id=paste0(pc.grid.discr$PC_1, pc.grid.discr$PC_2, pc.grid.discr$PC_3)
+
+#cnt.grid=dplyr::count(pc.grid.discr, PC_1, PC_2, PC_3, region, .drop=F)
+#cnt.grid.2=cnt.grid[!is.na(cnt.grid$region),]
+
+
+# para cada celda del grid env me fijo que set de puntos la ocupan
+# puntos = background u ocurrencias tanto de eu como de pat
+
+lv1=levels(pc.grid.discr$PC_1)
+lv2=levels(pc.grid.discr$PC_2)
+lv3=levels(pc.grid.discr$PC_3)
+
+# dataframe a llenar con valores de cada dimensión y con los sets que la ocupan (regs)
+grid.sp.df=data.frame(pc1=NA, pc2=NA, pc3=NA, regs=NA)
+
+
+grid.cell=1
+
+for (i in 1:length(lv1)) {
+  for (j in 1:length(lv2)) {
+    for (k in 1:length(lv3)) {
+      
+      message(grid.cell)
+      
+      
+      # lleno las columnas de coordenadas en el espacio env 
+      # (cada lv en realiad es un rango de coordendas)
+      grid.sp.df[grid.cell, 1:3]=c(lv1[i], lv2[j], lv3[k])
+      
+      # sets que ocupan esa celda en el espacio env
+      regs=pc.grid.discr$region[pc.grid.discr$PC_1==lv1[i]&
+                                  pc.grid.discr$PC_2==lv2[j]& 
+                                  pc.grid.discr$PC_3==lv3[k]]%>%
+        as.factor()%>%
+        levels()%>%
+        paste(collapse = "_")
+      
+      # guardo ese string
+      grid.sp.df$regs[grid.cell]=regs
+      
+      # cambio de celda
+      grid.cell=grid.cell+1
+      
+    }
+  }
+}
+
+# genero un unico vector indicador de las coordenadas (pegando los 3 valores)
+grid.sp.df$id=paste0(grid.sp.df$pc1, grid.sp.df$pc2, grid.sp.df$pc3)
+# levels(as.factor(grid.sp.df$regs))
+
+# filtro celdas disponibles en europa pero solo ocupadas en patagonia
+new.in.pat=grid.sp.df[grid.sp.df$regs=='eur.bg_pat.bg_pat.oc',]
+
+# filtro celdas disponibles en patagonia pero solo ocupadas en europa
+desc.in.pat=grid.sp.df[grid.sp.df$regs=='eur.bg_eur.oc_pat.bg',]
+
+
+
+# re-mapeo esas celdas en el espacio env al espacio geográfio de patagonia
+new.in.pat.coors=pc.grid.discr[pc.grid.discr$id%in%new.in.pat$id&
+                                 pc.grid.discr$region=='pat.bg', c('x', 'y')]
+
+desc.in.pat.coors=pc.grid.discr[pc.grid.discr$id%in%desc.in.pat$id&
+                                 pc.grid.discr$region=='pat.bg', c('x', 'y')]
+
+
+pat.coors=coordinates(pc.latam.patag$PC_1)%>%as.data.frame()
+
+
+new.r=pc.latam.patag$PC_1*0
+# relleno las celdas que tienen valores ambientales ocupados innovadoramente con 1
+new.r[ paste0(pat.coors$x, pat.coors$y) %in% paste0(new.in.pat.coors$x, new.in.pat.coors$y) ]=1
+
+
+desc.r=pc.latam.patag$PC_1*0
+# relleno celdas que tienen valores no ocupados en pat pero si en eu con 1
+desc.r[ paste0(pat.coors$x, pat.coors$y) %in% paste0(desc.in.pat.coors$x, desc.in.pat.coors$y) ]=1
+
+
+```
+
+
+# Estimación de efectos en el uso de nicho de B. dahlbomii
+
+## climatic data pre-processing
+
+```{r Pcess climatic data, eval=F, include=F}
+
+clim.data.process=F
+
+```
+
+
+```{r Climatic data directories, eval=F, include=F}
+
+## Climatic data ####
+
+# It is important to include the slash at the end of de directories names here
+
+# dir.create('../data') 
+
+raw_worldclim.dir='D:/raw climatic data/'
+cropped_bioclims.dir='./data/cropped_bioclims/'
+averaged_bioclims.dir='./data/av_bioclims/'
+averaged_PCs.dir='./data/av_PCs/'
+global_bioclim.dir='./data/global_bioclim/'
+
+
+```
+
+```{r Raw climatic data cropping, bioclimatic variables calculation and exporting, eval=F, include=F}
+
+### Raw climatic data cropping, bioclimatic variables calculation and exporting ####
+
+
+
+WorldClim.crop_n_bioclim.calc=function(worldclim_dir = './', 
+                    ex, cuts, year = 1961:2018, 
+                    out_crop_dir = './', 
+                    proj="+proj=utm +zone=19H +datum=WGS84",
+                    mask=NULL){
+  # Libraries and directories needed
+  
+  dir.create(out_crop_dir)
+  #dir.create(out_average_dir, showWarnings = F)
+  
+  if (any(cuts<min(year)) | any(cuts>=max(year))) {
+    stop('Cuts must be greater or equal than earliest year and minor than latest year')
+  }
+  
+  ## binning years in periods for cropped files tagging
+  per_delim<-c(min(year)-1, cuts, max(year)+1) # defining limits and cuts (0 and 3000 are just extreme values)
+  per_names<-paste0('period_', 1:(length(cuts)+1)) %>% as.character() # defining period names
+  per<-cut(year, breaks = per_delim, labels = per_names) # factor giving the corresponding period
+  
+  
+  ## Geographical cropping and bioclimatic variables calculation 
+  cropbox <- as(extent(ex), 'SpatialPolygons') # defining geographical limits 
+  months <- c("01","02","03","04","05","06","07","08","09","10","11","12")
+  
+  for (i in 1:length(year)) {
+    
+    # importation  and stack raw climatic data of corresponding year i
+    
+    message(paste0('Starting importation and monthly data stacking of ', year[i], '
+            '))
+    
+    prec <- worldclim_dir %>% 
+      paste0("wc2.1_2.5m_prec_", year[i], "-", months, ".tif") %>% 
+      stack()
+    message(paste0('prec_', year[i], ' stacked'))
+    
+    tmax <- worldclim_dir %>% 
+      paste0("wc2.1_2.5m_tmax_", year[i], "-", months, ".tif") %>% 
+      stack()
+    message(paste0('tmax_', year[i], ' stacked'))
+    
+    tmin <- worldclim_dir %>% 
+      paste0("wc2.1_2.5m_tmin_", year[i], "-", months, ".tif") %>% 
+      stack()
+    message(paste0('tmin_', year[i], ' stacked
+                   '))
+    
+    message('Geographical cropping of ', year[i], '
+            ')
+    
+    # crop, proyect and mask
+    crpd_prec=crop(x = prec, y = cropbox)
+    crpd_prec=projectRaster(crpd_prec, crs = nproj)
+    #crpd_prec=mask(crpd_prec, mask = mask)
+    message(paste0('prec_', year[i], ' cropped and masked'))
+    
+    crpd_tmax=crop(x = tmax, y = cropbox)
+    crpd_tmax=projectRaster(crpd_tmax, crs = nproj)
+    #crpd_tmax=mask(crpd_tmax, mask = mask)
+    message(paste0('tmax_', year[i], ' cropped and masked'))
+    
+    crpd_tmin=crop(x = tmin, y = cropbox)
+    crpd_tmin=projectRaster(crpd_tmin, crs = nproj)
+    #crpd_tmin=mask(crpd_tmin, mask = mask)
+    message(paste0('tmin_', year[i], ' cropped and masked
+                   '))
+    
+    message('Starting bioclimatic variables computation of ', year[i], '
+            ')
+    # Compute bioclimatic variables
+    biovars <- biovars(crpd_prec, crpd_tmin, crpd_tmax)
+    layer_filenames <- paste0(out_crop_dir, "bio", 1:19, 
+                              "_", year[i], '_', per[i])
+    message(paste0('Bioclimatic rasterStack of year ', year[i], ' computed
+                   '))
+    for(j in 1:19) { # export each bioclimatic raster j of the corresponding year i
+      single_band <- raster(biovars, layer = j)
+      writeRaster(single_band, layer_filenames[j], format = "GTiff", overwrite=T)
+      
+      # print cropping status
+      crop_percentage<-100*(19*(i-1)+j)/(length(year)*19)
+      message(paste('    ', year[i], ' bio', j, ' Exported',
+                    ' (', round(crop_percentage), '%)', sep='')) 
+    }
+    message('
+            ')
+    # deleting objects from memory
+    rm(prec, tmax, tmin, crpd_prec, crpd_tmin, crpd_tmax, biovars)
+  }
+  
+}
+
+#chl0=raster::getData("GADM",country="Chile",level=0)
+
+#chl=spTransform(chl0, CRS(nproj))
+
+#chl2=gSimplify(chl, tol=10000)
+
+#buf=buffer(chl2, 100000)
+
+#=clim$period_1 
+#r=projectRaster(r, crs=nproj)
+
+#r2=mask(x = r$bio1, mask = buf)
+#plot(r2)
+#plot(buf, add=T)
+#plot(chl2, add=T)
+
+#points(bombus[bombus$type==1,1:2], add=TRUE)
+
+ext=c(-76, -65, -56, -30)
+clim.data.process=F
+
+
+if (clim.data.process) {
+  init=Sys.time()
+  WorldClim.crop_n_bioclim.calc(worldclim_dir=raw_worldclim.dir, 
+                                ex=ext, cuts=1998, 
+                                out_crop_dir = cropped_bioclims.dir, 
+                                proj=nproj)
+  end=Sys.time()
+  
+  end-init
+}
+
+```
+
+
+```{r Bioclimatic variables averaging across periods and exporting, eval=F, include=F}
+### Bioclimatic variables averaging across periods and exporting ####
+
+Bioclim.av<-function(cuts, year = 1961:2018, 
+                      input_crop_dir = './', 
+                      out_average_dir = './'){
+  
+  dir.create(out_average_dir)
+  
+  if (any(cuts<min(year)) | any(cuts>=max(year))) {
+    stop('Cuts must be greater or equal than earliest year and minor than latest year')
+  }
+  
+  ## binning years in periods for cropped files tagging
+  per_delim<-c(min(year)-1, cuts, max(year)+1) # defining limits and cuts (0 and 3000 are just extreme values)
+  per_names<-paste0('period_', 1:(length(cuts)+1)) %>% as.character() # defining period names
+  per<-cut(year, breaks = per_delim, labels = per_names) # factor giving the corresponding period
+  
+  
+  # Libraries and directories needed
+  message('Starting bioclimatic variables averaging and exporting
+          ')
+  
+  ## Averaging by period
+  all_files<-list.files(input_crop_dir, full.names = T) # create list of paths to files
+  
+  bio_names<-paste0('bio', 1:19) # names of bioclimatic layers
+  
+  stacks_per_list<-list() # empty list to fill
+  
+  for (i in 1:length(per_names)) { # Big loop goes along periods 
+    per.i<-per_names[i]
+    files_per<-all_files[grep(per.i, all_files)] # select paths of i period files
+    av_bios<-list() # to fill with 19 mean bios corresponding to the i period
+    if(is.null(files_per)){
+      message(paste0('No bioclimatic rasters found for ', 
+                     per.i, ' in ', out_crop_dir))
+    }else{
+      for (j in 1:19) { # Small loop goes along bioclimatic variables
+        b.j<-bio_names[j]
+        b.j_<-paste0(b.j, '_')
+        files_bio<-files_per[grep(b.j_, files_per)] # select paths of j bio files
+        
+        bio.j_stack<-stack(files_bio) # import and stack raster files
+        bio.j_av<-calc(bio.j_stack, fun = mean) # average them
+        av_bios[[j]]<-bio.j_av # introduce to previously created list
+        
+        # print averaging status
+        av_percentage<-100*(19*(i-1)+j)/(length(per_names)*19) # percentage calculation
+        message(paste('    ', per.i, ' ', b.j, ' Averaged', 
+                      ' (', round(av_percentage), '%)', sep='')) # printing
+      }
+      
+      rm(bio.j_stack, bio.j_av) # Memory cleaning
+      
+      per.i_stack<-stack(av_bios) # stack the averaged bios of the i period
+      names(per.i_stack)<-bio_names # proper naming 
+      
+      stacks_per_list[[i]]<-per.i_stack # introduce to previously created list
+      names(stacks_per_list)[length(stacks_per_list)]<-per.i
+    }
+  }
+  
+  for (i in 1:length(stacks_per_list)) {
+    per.i_stack<-stacks_per_list[[i]]
+    writeRaster(per.i_stack,
+                paste0(out_average_dir, 'bioclim_', per_names[i]),
+                overwrite=T)
+  }
+}
+
+init2=Sys.time()
+Bioclim.av(cuts = c(1990), 
+            year = 1961:2018, 
+            out_average_dir = averaged_bioclims.dir, 
+            input_crop_dir = cropped_bioclims.dir)
+
+end2=Sys.time()
+
+end2-init2
+
+```
+
+
+
+
+
+
+
